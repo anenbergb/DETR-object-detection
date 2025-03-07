@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="yolo",
+    name="detr",
     version="1.0.0",
     url="https://github.com/anenbergb/DETR-object-detection",
     author="Bryan Anenberg",
