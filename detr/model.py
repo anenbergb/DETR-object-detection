@@ -36,33 +36,58 @@ class DETR(nn.Module):
         super().__init__()
         self.config = config
         self.backbone = Backbone(config)
-        self.input_proj = nn.Conv2d(self.backbone.num_channels, self.hidden_dim, kernel_size=1)
+        self.input_proj = nn.Conv2d(self.backbone.num_channels, config.hidden_dim, kernel_size=1)
         self.position_embedding = PositionalEncoding(
             num_pos_feats=config.hidden_size // 2, temperature=config.temperature
         )
+        self.query_embeding = nn.Embedding(config.num_queries, config.hidden_size)
 
         self.encoder = Encoder(config)
-        self.decoder = Decoder(config)
+        # self.decoder = Decoder(config)
 
-        self.class_embed = nn.Linear(self.hidden_size, self.num_classes + 1)
-        # self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        self.query_embed = nn.Embedding(self.num_queries, self.hidden_size)
-
-        # create class and box prediction heads
-        self.class_embed = nn.Linear(config.hidden_size, config.num_queries + 1)
-        self.bbox_embed = nn.Linear(config.hidden_size, 4)
+        self.class_embedding = nn.Linear(config.hidden_size, config.num_classes + 1)
+        self.bbox_embedding = MLP(config.hidden_size, config.hidden_size, output_dim=4, num_layers=3)
 
     def forward(self, images: torch.Tensor, heights: torch.Tensor, widths: torch.Tensor):
         x = self.backbone(images)
         x = self.input_proj(x)
-        feat_height = x.size(2)
-        feat_width = x.size(3)
-        pos = self.position_embedding(
-            feat_height, feat_width, heights, widths, self.backbone.scale
-        )  # (B,256,feat_height,feat_width)
+        B, C, H, W = x.shape
+        pos_embd = self.position_embedding(H, W, heights, widths, self.backbone.scale)  # (B,256,feat_height,feat_width)
+        attn_mask = self.make_attention_mask(H, W, heights, widths, self.backbone.scale)  # (B, feat_height, feat_width)
+        # Flatten the spatial dimensions
+        x = x.flatten(2).permute(2, 0, 1)  # (H*W, B, 256)
+        pos_embd = pos_embd.flatten(2).permute(2, 0, 1)  # (H*W, B, 256)
+        query_embed = self.query_embeding.weight.unsqueeze(1).repeat(1, B, 1)  # (100, B, 256)
+        attn_mask = attn_mask.flatten(1)  # (B, H*W)
+
+        # TODO: ensure that the ordering of the dimensions is correct
+        encoded_memory = self.encoder(x, position_embedding=pos_embd)
+        return encoded_memory
+
+    def make_attention_mask(
+        self,
+        embed_height: int,
+        embed_width: int,
+        image_heights: torch.Tensor,
+        image_widths: torch.Tensor,
+        scaling_factor: int = 32,
+    ):
+        """
+        Create a mask to prevent attention to padding tokens.
+        """
+        mask = torch.zeros(
+            (len(image_heights), embed_height, embed_width), dtype=torch.int, device=image_heights.device
+        )
+        scaled_heights = torch.ceil(image_heights / scaling_factor).to(torch.int)
+        scaled_widths = torch.ceil(image_widths / scaling_factor).to(torch.int)
+        for i, (height, width) in enumerate(zip(scaled_heights, scaled_widths)):
+            mask[i, :height, :width] = 1
+        return mask
 
 
 class Encoder(nn.Module):
+    """pre-LN Transformer Encoder"""
+
     def __init__(self, config: DETRConfig):
         super().__init__()
         self.config = config
@@ -90,6 +115,24 @@ class EncoderLayer(nn.Module):
         x = x + self.self_attention(query, key, value=x_attn)
         x = x + self.ffn(self.norm2(x))
         return x
+
+
+class MLP(nn.Module):
+    """Very simple multi-layer perceptron"""
+
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int):
+        super().__init__()
+        layers = []
+        for i in range(num_layers):
+            in_dim = input_dim if i == 0 else hidden_dim
+            out_dim = output_dim if i == num_layers - 1 else hidden_dim
+            layers.append(nn.Linear(in_dim, out_dim))
+            if i < num_layers - 1:
+                layers.append(nn.ReLU())
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
 
 
 class FFN(nn.Module):

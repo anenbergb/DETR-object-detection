@@ -87,7 +87,6 @@ class PositionalEncoding(nn.Module):
         batch_shape = (len(image_heights), embed_height, embed_width)
         scaled_heights = torch.ceil(image_heights / scaling_factor).to(torch.int)
         scaled_widths = torch.ceil(image_widths / scaling_factor).to(torch.int)
-        print(scaled_heights, scaled_widths)
         return batch_positional_encoding(
             batch_shape,
             scaled_heights,
