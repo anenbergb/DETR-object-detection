@@ -5,7 +5,7 @@ from torchvision.transforms import v2
 from torchvision.datasets import CocoDetection, wrap_dataset_for_transforms_v2
 
 from torchvision import tv_tensors
-from torchvision.transforms.v2._utils import _get_fill
+from torchvision.transforms.v2._utils import _get_fill, query_size
 
 
 def labels_getter(inputs: Any) -> List[torch.Tensor]:
@@ -18,10 +18,16 @@ def labels_getter(inputs: Any) -> List[torch.Tensor]:
 
 
 def get_train_transforms(
-    resize_size=608,
     mean=(0.485, 0.456, 0.406),  # ImageNet mean and std
     std=(0.229, 0.224, 0.225),
 ):
+    """
+    Random crops transforms are in the style of official detr implementation
+    https://github.com/facebookresearch/detr/blob/main/datasets/coco.py
+    """
+    scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+    max_size = 1333
+
     return v2.Compose(
         [
             v2.ToImage(),  # convert PIL image to tensor
@@ -34,7 +40,18 @@ def get_train_transforms(
                 hue=(-0.05, 0.05),
                 p=0.5,
             ),
-            v2.Resize((resize_size, resize_size)),  # resize the image. bilinear
+            v2.RandomChoice(
+                [
+                    v2.RandomShortestSize(scales, max_size),  # bilinear
+                    v2.Compose(
+                        [
+                            v2.RandomShortestSize([400, 500, 600]),  # bilinear
+                            RandomSizeCrop(384, 600),
+                            v2.RandomShortestSize(scales, max_size),  # bilinear
+                        ]
+                    ),
+                ],
+            ),
             v2.ClampBoundingBoxes(),  # clamp bounding boxes to be within the image
             v2.SanitizeBoundingBoxes(
                 labels_getter=labels_getter
@@ -49,15 +66,14 @@ def get_train_transforms(
 # Other possible transforms to consider
 # https://pytorch.org/vision/main/auto_examples/transforms/plot_transforms_e2e.html#sphx-glr-auto-examples-transforms-plot-transforms-e2e-py
 def get_val_transforms(
-    resize_size=608,
-    mean=(0.485, 0.456, 0.406),  # ImageNet mean and std
-    std=(0.229, 0.224, 0.225),
+    mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), min_size=800, max_size=1333  # ImageNet mean and std
 ):
     return v2.Compose(
         [
             v2.ToImage(),  # convert PIL image to tensor
             v2.ToDtype(torch.uint8, scale=True),
-            v2.Resize((resize_size, resize_size)),  # resize the image. bilinear
+            # maintain aspect ratio, resize the image to have smallest size = min_size
+            v2.RandomShortestSize(min_size, max_size),  # bilinear
             v2.ClampBoundingBoxes(),  # clamp bounding boxes to be within the image
             v2.SanitizeBoundingBoxes(
                 labels_getter=labels_getter
@@ -133,6 +149,7 @@ class CocoDataset(torch.utils.data.Dataset):
             img, target = self.transform(img, target)
         return img, target
 
+
 class PadToMultipleOf32(v2.Pad):
     def __init__(self, fill=0, padding_mode="constant"):
         super().__init__(padding=0, fill=fill, padding_mode=padding_mode)
@@ -154,3 +171,69 @@ class PadToMultipleOf32(v2.Pad):
             fill=fill,
             padding_mode=self.padding_mode,
         )
+
+
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Type, Union
+from torchvision.transforms.v2.functional._utils import _FillType
+
+
+class RandomSizeCrop(v2.RandomCrop):
+    def __init__(
+        self,
+        min_size: int,
+        max_size: int,
+    ) -> None:
+        self.min_size = min_size
+        self.max_size = max_size
+        super().__init__((100, 100), padding=None, pad_if_needed=False)
+
+    # The crop should be inbounds, no padding, so don't need to initialize any of those arguments to RandomCrop parent class
+    def make_params(self, flat_inputs: List[Any]) -> Dict[str, Any]:
+        image_height, image_width = query_size(flat_inputs)
+        cropped_width = torch.randint(self.min_size, min(image_width, self.max_size), size=(1,)).item()
+        cropped_height = torch.randint(self.min_size, min(image_height, self.max_size), size=(1,)).item()
+
+        top = torch.randint(0, image_height - cropped_height + 1, size=()).item()
+        left = torch.randint(0, image_width - cropped_width + 1, size=()).item()
+
+        return dict(
+            needs_crop=True,
+            top=top,
+            left=left,
+            height=cropped_height,
+            width=cropped_width,
+            needs_pad=False,
+            padding=[0, 0, 0, 0],
+        )
+
+        # self.size = (crop_height, crop_width)
+        # return super().make_params(flat_inputs)
+
+
+# https://github.com/facebookresearch/detr/blob/main/util/misc.py
+# def _onnx_nested_tensor_from_tensor_list(tensor_list: List[Tensor]) -> NestedTensor:
+#     max_size = []
+#     for i in range(tensor_list[0].dim()):
+#         max_size_i = torch.max(torch.stack([img.shape[i] for img in tensor_list]).to(torch.float32)).to(torch.int64)
+#         max_size.append(max_size_i)
+#     max_size = tuple(max_size)
+
+#     # work around for
+#     # pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+#     # m[: img.shape[1], :img.shape[2]] = False
+#     # which is not yet supported in onnx
+#     padded_imgs = []
+#     padded_masks = []
+#     for img in tensor_list:
+#         padding = [(s1 - s2) for s1, s2 in zip(max_size, tuple(img.shape))]
+#         padded_img = torch.nn.functional.pad(img, (0, padding[2], 0, padding[1], 0, padding[0]))
+#         padded_imgs.append(padded_img)
+
+#         m = torch.zeros_like(img[0], dtype=torch.int, device=img.device)
+#         padded_mask = torch.nn.functional.pad(m, (0, padding[2], 0, padding[1]), "constant", 1)
+#         padded_masks.append(padded_mask.to(torch.bool))
+
+#     tensor = torch.stack(padded_imgs)
+#     mask = torch.stack(padded_masks)
+
+#     return NestedTensor(tensor, mask=mask)
