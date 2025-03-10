@@ -148,29 +148,6 @@ class CocoDataset(torch.utils.data.Dataset):
         return img, target
 
 
-class PadToMultipleOf32(v2.Pad):
-    def __init__(self, fill=0, padding_mode="constant"):
-        super().__init__(padding=0, fill=fill, padding_mode=padding_mode)
-
-    def transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
-        # bounding boxes don't need padding since padding is applied
-        # to the bottom and right sides
-        padding = 0
-        if isinstance(inpt, tv_tensors.Image):
-            height, width = inpt.shape[-2:]
-            pad_width = (32 - width % 32) % 32
-            pad_height = (32 - height % 32) % 32
-            padding = (0, 0, pad_width, pad_height)
-        fill = _get_fill(self._fill, type(inpt))
-        return self._call_kernel(
-            v2.functional.pad,
-            inpt,
-            padding=padding,
-            fill=fill,
-            padding_mode=self.padding_mode,
-        )
-
-
 class RandomSizeCrop(v2.RandomCrop):
     def __init__(
         self,
@@ -201,8 +178,7 @@ class RandomSizeCrop(v2.RandomCrop):
         )
 
 
-def _max_by_axis(the_list):
-    # type: (List[List[int]]) -> List[int]
+def max_by_axis(the_list: List[list[int]], divisible_by: int = 32):
     maxes = the_list[0]
     for sublist in the_list[1:]:
         for index, item in enumerate(sublist):
@@ -216,7 +192,10 @@ def collate_function(batched_image_target):
     heights = torch.tensor([img.shape[1] for img in images], dtype=torch.int)
     widths = torch.tensor([img.shape[2] for img in images], dtype=torch.int)
 
-    max_size = _max_by_axis([list(img.shape) for img in images])
+    max_size = max_by_axis([list(img.shape) for img in images])
+    # ensure that the height and width are divisible by 32
+    divisible_by = 32
+    max_size[1:] = [((x + divisible_by - 1) // divisible_by) * divisible_by for x in max_size[1:]]
     batch_shape = [len(images)] + max_size
     dtype = images[0].dtype
     batch_tensor = torch.zeros(batch_shape, dtype=dtype)
