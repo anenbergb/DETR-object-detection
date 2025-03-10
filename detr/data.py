@@ -186,30 +186,32 @@ def max_by_axis(the_list: List[list[int]], divisible_by: int = 32):
     return maxes
 
 
-def collate_function(batched_image_target):
-    images, targets = list(zip(*batched_image_target))
-    # each image is of shape (C, H, W)
-    heights = torch.tensor([img.shape[1] for img in images], dtype=torch.int)
-    widths = torch.tensor([img.shape[2] for img in images], dtype=torch.int)
+def get_collate_function(divisible_by: int = 32):
+    def collate_function(batched_image_target):
+        images, targets = list(zip(*batched_image_target))
+        # each image is of shape (C, H, W)
+        heights = torch.tensor([img.shape[1] for img in images], dtype=torch.int)
+        widths = torch.tensor([img.shape[2] for img in images], dtype=torch.int)
 
-    max_size = max_by_axis([list(img.shape) for img in images])
-    # ensure that the height and width are divisible by 32
-    divisible_by = 32
-    max_size[1:] = [((x + divisible_by - 1) // divisible_by) * divisible_by for x in max_size[1:]]
-    batch_shape = [len(images)] + max_size
-    dtype = images[0].dtype
-    batch_tensor = torch.zeros(batch_shape, dtype=dtype)
-    for img, pad_img in zip(images, batch_tensor):
-        pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+        max_size = max_by_axis([list(img.shape) for img in images])
+        # ensure that the height and width are divisible by 32
+        max_size[1:] = [((x + divisible_by - 1) // divisible_by) * divisible_by for x in max_size[1:]]
+        batch_shape = [len(images)] + max_size
+        dtype = images[0].dtype
+        batch_tensor = torch.zeros(batch_shape, dtype=dtype)
+        for img, pad_img in zip(images, batch_tensor):
+            pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
 
-    batch = {
-        "image": batch_tensor,
-        "height": heights,
-        "width": widths,
-        "image_id": torch.tensor([target["image_id"] for target in targets], dtype=torch.int),
-    }
+        batch = {
+            "image": batch_tensor,
+            "height": heights,
+            "width": widths,
+            "image_id": torch.tensor([target["image_id"] for target in targets], dtype=torch.int),
+        }
 
-    label_names = ["boxes", "class_idx", "class_id", "iscrowd"]
-    for label_name in label_names:
-        batch[label_name] = [x[label_name] for x in targets]
-    return batch
+        label_names = ["boxes", "class_idx", "class_id", "iscrowd"]
+        for label_name in label_names:
+            batch[label_name] = [x[label_name] for x in targets]
+        return batch
+
+    return collate_function

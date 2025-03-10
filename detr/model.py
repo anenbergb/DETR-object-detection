@@ -3,19 +3,25 @@ import torch
 from torch import nn
 import math
 from typing import Optional
+from torchvision.models import get_model
+from torchvision.ops import FrozenBatchNorm2d
 from torchvision.models._utils import IntermediateLayerGetter
+
+from detr.position_encoding import PositionalEncoding
+
 
 @dataclass
 class DETRConfig:
     backbone: str = "resnet50"
-    position_embedding_type: str = "sine"
+    # positional encoding
+    temperature: int = 10000
 
     num_queries: int = 100
     num_enc_layers: int = 6
     num_dec_layers: int = 6
     num_attention_heads: int = 8
     hidden_size: int = 256
-    ffn_scale_factor: int = 8 # 256x8 = 2048
+    ffn_scale_factor: int = 8  # 256x8 = 2048
     hidden_dropout_prob: float = 0.1
     attention_probs_dropout_prob: float = 0.1
 
@@ -29,21 +35,31 @@ class DETR(nn.Module):
     def __init__(self, config: DETRConfig):
         super().__init__()
         self.config = config
+        self.backbone = Backbone(config)
+        self.input_proj = nn.Conv2d(self.backbone.num_channels, self.hidden_dim, kernel_size=1)
+        self.position_embedding = PositionalEncoding(
+            num_pos_feats=config.hidden_size // 2, temperature=config.temperature
+        )
+
+        self.encoder = Encoder(config)
+        self.decoder = Decoder(config)
 
         self.class_embed = nn.Linear(self.hidden_size, self.num_classes + 1)
         # self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.query_embed = nn.Embedding(self.num_queries, self.hidden_size)
-        # self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
-
-        # create backbone
-        # self.backbone = Backbone(config)
-
-        # create position embeddings
-        self.position_embedding = PositionEmbedding(config)
 
         # create class and box prediction heads
         self.class_embed = nn.Linear(config.hidden_size, config.num_queries + 1)
         self.bbox_embed = nn.Linear(config.hidden_size, 4)
+
+    def forward(self, images: torch.Tensor, heights: torch.Tensor, widths: torch.Tensor):
+        x = self.backbone(images)
+        x = self.input_proj(x)
+        feat_height = x.size(2)
+        feat_width = x.size(3)
+        pos = self.position_embedding(
+            feat_height, feat_width, heights, widths, self.backbone.scale
+        )  # (B,256,feat_height,feat_width)
 
 
 class Encoder(nn.Module):
@@ -53,12 +69,12 @@ class Encoder(nn.Module):
         self.layer = nn.ModuleList([EncoderLayer(config) for _ in range(config.num_enc_layers)])
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-    def forward(self, x: torch.Tensor
-        position_embedding: Optional[Tensor] = None):
+    def forward(self, x: torch.Tensor, position_embedding: Optional[torch.Tensor] = None):
 
         for layer in self.layer:
-            x = layer(x, position_embedding = position_embedding)
+            x = layer(x, position_embedding=position_embedding)
         return self.norm(x)
+
 
 class EncoderLayer(nn.Module):
     def __init__(self, config: DETRConfig):
@@ -68,12 +84,13 @@ class EncoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-    def forward(self, x: torch.Tensor, position_embedding: Optional[Tensor] = None):
+    def forward(self, x: torch.Tensor, position_embedding: Optional[torch.Tensor] = None):
         x_attn = self.norm1(x)
         query = key = x_attn + position_embedding
         x = x + self.self_attention(query, key, value=x_attn)
         x = x + self.ffn(self.norm2(x))
         return x
+
 
 class FFN(nn.Module):
     """
@@ -152,16 +169,19 @@ class ScaledDotProductAttention(nn.Module):
         Returns:
             torch.Tensor: Output tensor after applying attention.
         """
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality
+
+        # TODO: make sure this works for cross attention, where I think the
+        # dimensions of query, key, and value are different
+        B, T, C = query.size()  # batch size, sequence length, embedding dimensionality
 
         # calculate query, key, value for all heads in batch
         # C is hidden_size, which is 256 in DETR
         # nh is "number of heads", which is 8 in DETR
         # hs is "head size", which is C // nh = 256 // 8 = 32
 
-        query = self.query_proj(x)  # (B, T, C)
-        key = self.key_proj(x)
-        value = self.value_proj(x)
+        query = self.query_proj(query)  # (B, T, C)
+        key = self.key_proj(key)
+        value = self.value_proj(value)
 
         # (B, T, C) -> (B, T, nh, C/nh) = (B, T, nh, 32) --transpose(1,2)--> (B, nh, T, 32)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, 32)
@@ -197,3 +217,17 @@ class ScaledDotProductAttention(nn.Module):
         y = self.c_proj(y)
         y = self.dropout(y)
         return y
+
+
+class Backbone(nn.Module):
+    def __init__(self, config: DETRConfig):
+        super().__init__()
+        self.config = config
+        assert config.backbone in ("resnet50", "resnet101"), "Only resnet50 and resnet101 backbones are supported"
+        model = get_model(config.backbone, weights="DEFAULT", norm_layer=FrozenBatchNorm2d)
+        self.backbone = IntermediateLayerGetter(model, return_layers={"layer4": "final_feature_map"})
+        self.num_channels = 2048
+        self.scale = 32
+
+    def forward(self, x: torch.Tensor):
+        return self.backbone(x)["final_feature_map"]

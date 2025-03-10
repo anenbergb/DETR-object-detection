@@ -54,11 +54,10 @@ def positional_encoding(x, y, num_pos_feats=128, temperature=10000):
     return pos
 
 
-def batch_positional_encoding(batch_shape, heights, widths, num_pos_feats=128, temperature=10000):
-    batch_grid_x = torch.zeros(batch_shape)
-    batch_grid_y = torch.zeros(batch_shape)
+def batch_positional_encoding(batch_shape, heights, widths, num_pos_feats=128, temperature=10000, device="cpu"):
+    batch_grid_x = torch.zeros(batch_shape, dtype=torch.float32, device=device)
+    batch_grid_y = torch.zeros(batch_shape, dtype=torch.float32, device=device)
     for batch_i, (height, width) in enumerate(zip(heights, widths)):
-
         x_axis = torch.linspace(0, 1, width)
         y_axis = torch.linspace(0, 1, height)
         grid_y, grid_x = torch.meshgrid(y_axis, x_axis, indexing="ij")
@@ -74,5 +73,26 @@ class PositionalEncoding(nn.Module):
         self.num_pos_feats = num_pos_feats
         self.temperature = temperature
 
-    def forward(self, batch_shape, heights, widths):
-        return batch_positional_encoding(batch_shape, heights, widths, self.num_pos_feats, self.temperature)
+    def forward(
+        self,
+        embed_height: int,
+        embed_width: int,
+        image_heights: torch.Tensor,
+        image_widths: torch.Tensor,
+        scaling_factor: int = 32,
+    ):
+        """
+        Downscale the image heights and widths by the scaling factor to match the embed height and widths
+        """
+        batch_shape = (len(image_heights), embed_height, embed_width)
+        scaled_heights = torch.ceil(image_heights / scaling_factor).to(torch.int)
+        scaled_widths = torch.ceil(image_widths / scaling_factor).to(torch.int)
+        print(scaled_heights, scaled_widths)
+        return batch_positional_encoding(
+            batch_shape,
+            scaled_heights,
+            scaled_widths,
+            self.num_pos_feats,
+            self.temperature,
+            device=image_heights.device,
+        )
