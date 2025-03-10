@@ -63,8 +63,6 @@ def get_train_transforms(
     )
 
 
-# Other possible transforms to consider
-# https://pytorch.org/vision/main/auto_examples/transforms/plot_transforms_e2e.html#sphx-glr-auto-examples-transforms-plot-transforms-e2e-py
 def get_val_transforms(
     mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), min_size=800, max_size=1333  # ImageNet mean and std
 ):
@@ -173,10 +171,6 @@ class PadToMultipleOf32(v2.Pad):
         )
 
 
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Type, Union
-from torchvision.transforms.v2.functional._utils import _FillType
-
-
 class RandomSizeCrop(v2.RandomCrop):
     def __init__(
         self,
@@ -206,34 +200,37 @@ class RandomSizeCrop(v2.RandomCrop):
             padding=[0, 0, 0, 0],
         )
 
-        # self.size = (crop_height, crop_width)
-        # return super().make_params(flat_inputs)
+
+def _max_by_axis(the_list):
+    # type: (List[List[int]]) -> List[int]
+    maxes = the_list[0]
+    for sublist in the_list[1:]:
+        for index, item in enumerate(sublist):
+            maxes[index] = max(maxes[index], item)
+    return maxes
 
 
-# https://github.com/facebookresearch/detr/blob/main/util/misc.py
-# def _onnx_nested_tensor_from_tensor_list(tensor_list: List[Tensor]) -> NestedTensor:
-#     max_size = []
-#     for i in range(tensor_list[0].dim()):
-#         max_size_i = torch.max(torch.stack([img.shape[i] for img in tensor_list]).to(torch.float32)).to(torch.int64)
-#         max_size.append(max_size_i)
-#     max_size = tuple(max_size)
+def collate_function(batched_image_target):
+    images, targets = list(zip(*batched_image_target))
+    # each image is of shape (C, H, W)
+    heights = torch.tensor([img.shape[1] for img in images], dtype=torch.int)
+    widths = torch.tensor([img.shape[2] for img in images], dtype=torch.int)
 
-#     # work around for
-#     # pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
-#     # m[: img.shape[1], :img.shape[2]] = False
-#     # which is not yet supported in onnx
-#     padded_imgs = []
-#     padded_masks = []
-#     for img in tensor_list:
-#         padding = [(s1 - s2) for s1, s2 in zip(max_size, tuple(img.shape))]
-#         padded_img = torch.nn.functional.pad(img, (0, padding[2], 0, padding[1], 0, padding[0]))
-#         padded_imgs.append(padded_img)
+    max_size = _max_by_axis([list(img.shape) for img in images])
+    batch_shape = [len(images)] + max_size
+    dtype = images[0].dtype
+    batch_tensor = torch.zeros(batch_shape, dtype=dtype)
+    for img, pad_img in zip(images, batch_tensor):
+        pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
 
-#         m = torch.zeros_like(img[0], dtype=torch.int, device=img.device)
-#         padded_mask = torch.nn.functional.pad(m, (0, padding[2], 0, padding[1]), "constant", 1)
-#         padded_masks.append(padded_mask.to(torch.bool))
+    batch = {
+        "image": batch_tensor,
+        "height": heights,
+        "width": widths,
+        "image_id": torch.tensor([target["image_id"] for target in targets], dtype=torch.int),
+    }
 
-#     tensor = torch.stack(padded_imgs)
-#     mask = torch.stack(padded_masks)
-
-#     return NestedTensor(tensor, mask=mask)
+    label_names = ["boxes", "class_idx", "class_id", "iscrowd"]
+    for label_name in label_names:
+        batch[label_name] = [x[label_name] for x in targets]
+    return batch
