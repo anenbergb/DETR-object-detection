@@ -58,7 +58,7 @@ class DETR(nn.Module):
         # (B, 256, H, W) -> (B, 256, H*W) -> (B, H*W, 256)
         x = x.flatten(2).permute(0, 2, 1)
         pos_embd = pos_embd.flatten(2).permute(0, 2, 1)  # (B, H*W, 256)
-        attn_mask = attn_mask.flatten(1)  # (B, H*W)
+        key_padding_mask = attn_mask.flatten(1)  # (B, H*W)
         # query_embed = self.query_embeding.weight.unsqueeze(1).repeat(1, B, 1)  # (100, B, 256)
         query_embed = self.query_embeding.weight.unsqueeze(0).repeat(B, 1, 1)  # (B, 100, 256)
 
@@ -149,15 +149,29 @@ class ScaledDotProductAttention(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        # attention_mask: torch.LongTensor
-        # key_padding_mask: Optional[Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass for the attention mechanism.
 
         Args:
-            x: torch.Tensor
-                Input tensor.
+            query: torch.Tensor
+                Query tensor.
+            key: torch.Tensor
+                Key tensor.
+            value: torch.Tensor
+                Value tensor.
+            attention_mask: torch.Tensor
+                If specified, a mask of shape (N,L) preventing attention to certain positions
+
+            key_padding_mask: torch.Tensor
+                If specified, a mask of shape (N,L) indicating which elements within key to ignore
+                for the purpose of attention (i.e. treat as “padding”).
+                Binary and float masks are supported.
+                For a binary mask, a True value indicates that the corresponding key value will be ignored for the purpose of attention.
+                For a float mask, it will be directly added to the corresponding key value.
+
 
         Returns:
             torch.Tensor: Output tensor after applying attention.
