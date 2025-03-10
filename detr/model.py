@@ -53,19 +53,21 @@ class DETR(nn.Module):
         x = self.input_proj(x)
         B, C, H, W = x.shape
         pos_embd = self.position_embedding(H, W, heights, widths, self.backbone.scale)  # (B,256,feat_height,feat_width)
-        attn_mask = self.make_attention_mask(H, W, heights, widths, self.backbone.scale)  # (B, feat_height, feat_width)
+        image_padding_mask = self.make_image_padding_mask(
+            H, W, heights, widths, self.backbone.scale
+        )  # (B, feat_height, feat_width)
         # Flatten the spatial dimensions
         # (B, 256, H, W) -> (B, 256, H*W) -> (B, H*W, 256)
         x = x.flatten(2).permute(0, 2, 1)
         pos_embd = pos_embd.flatten(2).permute(0, 2, 1)  # (B, H*W, 256)
-        key_padding_mask = attn_mask.flatten(1)  # (B, H*W)
+        image_padding_mask = image_padding_mask.flatten(1)  # (B, H*W)
         # query_embed = self.query_embeding.weight.unsqueeze(1).repeat(1, B, 1)  # (100, B, 256)
         query_embed = self.query_embeding.weight.unsqueeze(0).repeat(B, 1, 1)  # (B, 100, 256)
 
-        encoded_memory = self.encoder(x, position_embedding=pos_embd)
+        encoded_memory = self.encoder(x, position_embedding=pos_embd, key_padding_mask=image_padding_mask)
         return encoded_memory
 
-    def make_attention_mask(
+    def make_image_padding_mask(
         self,
         embed_height: int,
         embed_width: int,
@@ -74,15 +76,15 @@ class DETR(nn.Module):
         scaling_factor: int = 32,
     ):
         """
-        Create a mask to prevent attention to padding tokens.
+        Returns binary mask of shape (B, embed_height, embed_width) containing True on padded pixels.
         """
         mask = torch.zeros(
-            (len(image_heights), embed_height, embed_width), dtype=torch.int, device=image_heights.device
+            (len(image_heights), embed_height, embed_width), dtype=torch.bool, device=image_heights.device
         )
         scaled_heights = torch.ceil(image_heights / scaling_factor).to(torch.int)
         scaled_widths = torch.ceil(image_widths / scaling_factor).to(torch.int)
         for i, (height, width) in enumerate(zip(scaled_heights, scaled_widths)):
-            mask[i, :height, :width] = 1
+            mask[i, height:, width:] = True
         return mask
 
 
@@ -95,10 +97,9 @@ class Encoder(nn.Module):
         self.layer = nn.ModuleList([EncoderLayer(config) for _ in range(config.num_enc_layers)])
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-    def forward(self, x: torch.Tensor, position_embedding: Optional[torch.Tensor] = None):
-
+    def forward(self, x: torch.Tensor, position_embedding: torch.Tensor, key_padding_mask: torch.BoolTensor):
         for layer in self.layer:
-            x = layer(x, position_embedding=position_embedding)
+            x = layer(x, position_embedding, key_padding_mask)
         return self.norm(x)
 
 
@@ -110,10 +111,10 @@ class EncoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-    def forward(self, x: torch.Tensor, position_embedding: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, position_embedding: torch.Tensor, key_padding_mask: torch.BoolTensor):
         x_attn = self.norm1(x)
         query = key = x_attn + position_embedding
-        x = x + self.self_attention(query, key, value=x_attn)
+        x = x + self.self_attention(query, key, value=x_attn, key_padding_mask=key_padding_mask)
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -149,29 +150,44 @@ class ScaledDotProductAttention(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.BoolTensor] = None,
+        attention_mask: Optional[torch.BoolTensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass for the attention mechanism.
 
         Args:
-            query: torch.Tensor
+            query: torch.Tensor (B,L,C)
                 Query tensor.
-            key: torch.Tensor
+                L is target sequence length, C is hidden size
+            key: torch.Tensor (B,S,C)
                 Key tensor.
-            value: torch.Tensor
+                S is source sequence length, C is hidden size
+            value: torch.Tensor (B,S,C)
                 Value tensor.
-            attention_mask: torch.Tensor
-                If specified, a mask of shape (N,L) preventing attention to certain positions
+                S is source sequence length, C is hidden size
+            key_padding_mask: torch.Tensor (B,S)
+                S is source sequence length
+                If provided, specified padding elements in the key sequence will
+                be ignored by the attention.
+                This is an binary mask.
+                When the value is True, the corresponding value on the attention layer will be filled with -inf.
 
-            key_padding_mask: torch.Tensor
-                If specified, a mask of shape (N,L) indicating which elements within key to ignore
-                for the purpose of attention (i.e. treat as “padding”).
-                Binary and float masks are supported.
-                For a binary mask, a True value indicates that the corresponding key value will be ignored for the purpose of attention.
-                For a float mask, it will be directly added to the corresponding key value.
+            attention_mask: torch.Tensor (L,S)
+                If specified, a mask of shape (L,S) preventing attention to certain positions
+                It could be used to enforce causality (auto-regressive models like decoders)
+                or to apply custom attention patterns.
+                Unlike key_padding_mask, which is specific to padding in the key sequence,
+                attn_mask operates on the relationship between query and key positions.
 
+                This is a binary mask
+                True indicates positions that should be masked (not attended to).
+                False indicates positions that can be attended to.
+
+                Example causal attention mask where S=3, L=3:
+                attn_mask = tensor([[False,  True,  True],  # Pos 0 attends to Pos 0 only
+                                    [False, False,  True],  # Pos 1 attends to Pos 0, 1
+                                    [False, False, False]]) # Pos 2 attends to all
 
         Returns:
             torch.Tensor: Output tensor after applying attention.
@@ -179,35 +195,43 @@ class ScaledDotProductAttention(nn.Module):
 
         # TODO: make sure this works for cross attention, where I think the
         # dimensions of query, key, and value are different
-        B, T, C = query.size()  # batch size, sequence length, embedding dimensionality
+        B, L, C = query.size()  # batch size, target sequence length, embedding dimensionality
+        S = key.size(1)  # source sequence length
 
         # calculate query, key, value for all heads in batch
         # C is hidden_size, which is 256 in DETR
         # nh is "number of heads", which is 8 in DETR
         # hs is "head size", which is C // nh = 256 // 8 = 32
 
-        query = self.query_proj(query)  # (B, T, C)
-        key = self.key_proj(key)
+        query = self.query_proj(query)  # (B, L, C)
+        key = self.key_proj(key)  # (B, S, C)
         value = self.value_proj(value)
 
-        # (B, T, C) -> (B, T, nh, C/nh) = (B, T, nh, 32) --transpose(1,2)--> (B, nh, T, 32)
-        q = query.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, 32)
-        k = key.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, 32)
-        v = value.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, 32)
+        # (B, L, C) -> (B, L, nh, C/nh) = (B, L, nh, 32) --transpose(1,2)--> (B, nh, L, 32)
+        q = query.view(B, L, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, L, 32)
+        k = key.view(B, S, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, S, 32)
+        v = value.view(B, S, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, S, 32)
 
-        # attention multiplies the head_size dimension (T,32) x (32,T) = (T,T)
-        # (B, nh, T, 32) x (B, nh, 32, T) -> (B, nh, T, T)
+        # attention multiplies the head_size dimension (L,32) x (32,S) = (L,S)
+        # (B, nh, L, 32) x (B, nh, 32, S) -> (B, nh, L, S)
         att = q @ k.transpose(2, 3)
         att = att / math.sqrt(self.head_size)
 
-        # attention mask is a binary mask of shape (B,T) that is 1 for positions we want to attend to
-        # attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
-        # Broadcast to (B, nh, T, T) by applying it to the key dimension
-        # Mask out padding by setting scores to -inf where attn_mask is 0
-        # att = att.masked_fill(attention_mask == 0, torch.finfo(att.dtype).min)  # (B, nh, T, T)
+        if key_padding_mask is not None:
+            # Reshape and expand to match attn_weights dimensions
+            att = att.masked_fill(
+                key_padding_mask.unsqueeze(1).unsqueeze(2), torch.finfo(att.dtype).min  # [B, 1, 1, S]
+            )
 
-        # att describes the relation between the tokens in the sequence
-        # how much token 0 should be a mixture of tokens 0 through T
+        if attention_mask is not None:
+            # attention_mask is shape (L,S) so it can be broadcast to (B, nh, L, S)
+            att = att.masked_fill(attention_mask, torch.finfo(att.dtype).min)
+
+        # attention mask (L,S) describes the relation between the tokens in the query sequence [0, L-1]
+        # and the tokens in the source(key,value) sequence [0, S-1]
+        # The attention value att[i,j]=p reflects how query token i should consist of 'p' percent
+        # of the information from source token j
+        #  sum(att[i,:]) = 1
         att = nn.functional.softmax(att, dim=-1)
         # Randomly sets some attention weights to zero during training,
         # meaning certain key-value pairs are ignored for that forward pass.
@@ -215,11 +239,11 @@ class ScaledDotProductAttention(nn.Module):
         att = self.dropout_attn(att)
 
         # re-mix the value tokens, by multiplying each token by the corresponding
-        # weights in the attention matrix. Do this across all 64 dimensions
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, 32) -> (B, nh, T, 32)
+        # weights in the attention matrix. Do this across all 32 dimensions
+        y = att @ v  # (B, nh, L, S) x (B, nh, S, 32) -> (B, nh, L, 32)
 
-        # (B, nh, T, 32) -> (B, T, nh, 32) -> (B, T, nh*32 = 8*32 = 256)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # (B, nh, L, 32) -> (B, L, nh, 32) -> (B, L, nh*32 = 8*32 = 256)
+        y = y.transpose(1, 2).contiguous().view(B, L, C)
         # output projection
         y = self.output_proj(y)
         y = self.dropout(y)
