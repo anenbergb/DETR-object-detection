@@ -36,11 +36,11 @@ class DETR(nn.Module):
         super().__init__()
         self.config = config
         self.backbone = Backbone(config)
-        self.input_proj = nn.Conv2d(self.backbone.num_channels, config.hidden_dim, kernel_size=1)
+        self.input_proj = nn.Conv2d(self.backbone.num_channels, config.hidden_size, kernel_size=1)
         self.position_embedding = PositionalEncoding(
             num_pos_feats=config.hidden_size // 2, temperature=config.temperature
         )
-        self.query_embeding = nn.Embedding(config.num_queries, config.hidden_size)
+        self.query_embeding = nn.Embedding(config.num_queries, config.hidden_size)  # (100, 256)
 
         self.encoder = Encoder(config)
         # self.decoder = Decoder(config)
@@ -55,12 +55,13 @@ class DETR(nn.Module):
         pos_embd = self.position_embedding(H, W, heights, widths, self.backbone.scale)  # (B,256,feat_height,feat_width)
         attn_mask = self.make_attention_mask(H, W, heights, widths, self.backbone.scale)  # (B, feat_height, feat_width)
         # Flatten the spatial dimensions
-        x = x.flatten(2).permute(2, 0, 1)  # (H*W, B, 256)
-        pos_embd = pos_embd.flatten(2).permute(2, 0, 1)  # (H*W, B, 256)
-        query_embed = self.query_embeding.weight.unsqueeze(1).repeat(1, B, 1)  # (100, B, 256)
+        # (B, 256, H, W) -> (B, 256, H*W) -> (B, H*W, 256)
+        x = x.flatten(2).permute(0, 2, 1)
+        pos_embd = pos_embd.flatten(2).permute(0, 2, 1)  # (B, H*W, 256)
         attn_mask = attn_mask.flatten(1)  # (B, H*W)
+        # query_embed = self.query_embeding.weight.unsqueeze(1).repeat(1, B, 1)  # (100, B, 256)
+        query_embed = self.query_embeding.weight.unsqueeze(0).repeat(B, 1, 1)  # (B, 100, 256)
 
-        # TODO: ensure that the ordering of the dimensions is correct
         encoded_memory = self.encoder(x, position_embedding=pos_embd)
         return encoded_memory
 
@@ -115,57 +116,6 @@ class EncoderLayer(nn.Module):
         x = x + self.self_attention(query, key, value=x_attn)
         x = x + self.ffn(self.norm2(x))
         return x
-
-
-class MLP(nn.Module):
-    """Very simple multi-layer perceptron"""
-
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int):
-        super().__init__()
-        layers = []
-        for i in range(num_layers):
-            in_dim = input_dim if i == 0 else hidden_dim
-            out_dim = output_dim if i == num_layers - 1 else hidden_dim
-            layers.append(nn.Linear(in_dim, out_dim))
-            if i < num_layers - 1:
-                layers.append(nn.ReLU())
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class FFN(nn.Module):
-    """
-    Feed-Forward Network (FFN) used in DETR.
-
-    Args:
-        config: DETRConfig
-            Configuration for the BERT model.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size * self.ffn_scale_factor),
-            nn.GELU(approximate="tanh"),
-            nn.Dropout(config.hidden_dropout_prob),
-            nn.Linear(config.hidden_size * self.ffn_scale_factor, config.hidden_size),
-            nn.Dropout(config.hidden_dropout_prob),
-        )
-
-    def forward(self, x):
-        """
-        Forward pass for the feed-forward network.
-
-        Args:
-            x: torch.Tensor
-                Input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after applying the feed-forward network.
-        """
-        return self.layers(x)
 
 
 class ScaledDotProductAttention(nn.Module):
@@ -227,9 +177,9 @@ class ScaledDotProductAttention(nn.Module):
         value = self.value_proj(value)
 
         # (B, T, C) -> (B, T, nh, C/nh) = (B, T, nh, 32) --transpose(1,2)--> (B, nh, T, 32)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, 32)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, 32)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, 32)
+        q = query.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, 32)
+        k = key.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, 32)
+        v = value.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, 32)
 
         # attention multiplies the head_size dimension (T,32) x (32,T) = (T,T)
         # (B, nh, T, 32) x (B, nh, 32, T) -> (B, nh, T, T)
@@ -257,9 +207,60 @@ class ScaledDotProductAttention(nn.Module):
         # (B, nh, T, 32) -> (B, T, nh, 32) -> (B, T, nh*32 = 8*32 = 256)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         # output projection
-        y = self.c_proj(y)
+        y = self.output_proj(y)
         y = self.dropout(y)
         return y
+
+
+class MLP(nn.Module):
+    """Very simple multi-layer perceptron"""
+
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int):
+        super().__init__()
+        layers = []
+        for i in range(num_layers):
+            in_dim = input_dim if i == 0 else hidden_dim
+            out_dim = output_dim if i == num_layers - 1 else hidden_dim
+            layers.append(nn.Linear(in_dim, out_dim))
+            if i < num_layers - 1:
+                layers.append(nn.ReLU())
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class FFN(nn.Module):
+    """
+    Feed-Forward Network (FFN) used in DETR.
+
+    Args:
+        config: DETRConfig
+            Configuration for the BERT model.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size * config.ffn_scale_factor),
+            nn.GELU(approximate="tanh"),
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(config.hidden_size * config.ffn_scale_factor, config.hidden_size),
+            nn.Dropout(config.hidden_dropout_prob),
+        )
+
+    def forward(self, x):
+        """
+        Forward pass for the feed-forward network.
+
+        Args:
+            x: torch.Tensor
+                Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after applying the feed-forward network.
+        """
+        return self.layers(x)
 
 
 class Backbone(nn.Module):
