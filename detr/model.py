@@ -16,9 +16,9 @@ class DETRConfig:
     # positional encoding
     temperature: int = 10000
 
-    num_queries: int = 100
-    num_enc_layers: int = 6
-    num_dec_layers: int = 6
+    num_object_queries: int = 100
+    num_encoder_layers: int = 6
+    num_decoder_layers: int = 6
     num_attention_heads: int = 8
     hidden_size: int = 256
     ffn_scale_factor: int = 8  # 256x8 = 2048
@@ -40,10 +40,10 @@ class DETR(nn.Module):
         self.position_embedding = PositionalEncoding(
             num_pos_feats=config.hidden_size // 2, temperature=config.temperature
         )
-        self.query_embeding = nn.Embedding(config.num_queries, config.hidden_size)  # (100, 256)
+        self.object_query_embedding = nn.Embedding(config.num_object_queries, config.hidden_size)  # (100, 256)
 
         self.encoder = Encoder(config)
-        # self.decoder = Decoder(config)
+        self.decoder = Decoder(config)
 
         self.class_embedding = nn.Linear(config.hidden_size, config.num_classes + 1)
         self.bbox_embedding = MLP(config.hidden_size, config.hidden_size, output_dim=4, num_layers=3)
@@ -61,11 +61,17 @@ class DETR(nn.Module):
         x = x.flatten(2).permute(0, 2, 1)
         pos_embd = pos_embd.flatten(2).permute(0, 2, 1)  # (B, H*W, 256)
         image_padding_mask = image_padding_mask.flatten(1)  # (B, H*W)
-        # query_embed = self.query_embeding.weight.unsqueeze(1).repeat(1, B, 1)  # (100, B, 256)
-        query_embed = self.query_embeding.weight.unsqueeze(0).repeat(B, 1, 1)  # (B, 100, 256)
+        query_embed = self.object_query_embedding.weight.unsqueeze(0).repeat(B, 1, 1)  # (B, 100, 256)
 
-        encoded_memory = self.encoder(x, position_embedding=pos_embd, key_padding_mask=image_padding_mask)
-        return encoded_memory
+        # Encoded image tokens (B, H*W, 256)
+        encoded_image_tokens = self.encoder(x, position_embedding=pos_embd, key_padding_mask=image_padding_mask)
+        decoded_object_queries = self.decoder(
+            encoded_image_tokens,
+            position_embedding=pos_embd,
+            object_query_embedding=query_embed,
+            key_padding_mask=image_padding_mask,
+        )
+        return decoded_object_queries
 
     def make_image_padding_mask(
         self,
@@ -88,17 +94,72 @@ class DETR(nn.Module):
         return mask
 
 
+class Decoder(nn.Module):
+    """pre-LN Transformer Decoder"""
+
+    def __init__(self, config: DETRConfig):
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList([DecoderLayer(config) for _ in range(config.num_decoder_layers)])
+        self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(
+        self,
+        encoded_image_tokens: torch.Tensor,
+        position_embedding: torch.Tensor,
+        object_query_embedding: torch.Tensor,
+        key_padding_mask: torch.BoolTensor,
+    ):
+        x = torch.zeros_like(object_query_embedding)
+        for layer in self.layers:
+            x = layer(x, encoded_image_tokens, object_query_embedding, position_embedding, key_padding_mask)
+        # Consider returning intermediates
+        return self.norm(x)
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, config: DETRConfig):
+        super().__init__()
+        self.self_attention = ScaledDotProductAttention(config)
+        self.cross_attention = ScaledDotProductAttention(config)
+
+        self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm3 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.ffn = FFN(config)
+
+    def forward(
+        self,
+        x: torch.Tensor,  # (B, 100, 256)
+        encoded_image_tokens: torch.Tensor,  # (B, H*W, 256)
+        object_query_embedding: torch.Tensor,  # (B, 100, 256)
+        position_embedding: torch.Tensor,  # (B, H*W, 256)
+        key_padding_mask: torch.BoolTensor,  # (B, H*W)
+    ):
+        x_attn = self.norm1(x)
+        query = key = x_attn + object_query_embedding
+        x = x + self.self_attention(query, key, value=x_attn)
+
+        x_attn = self.norm2(x)
+        query = x_attn + object_query_embedding
+        key = encoded_image_tokens + position_embedding
+        x = x + self.cross_attention(query, key, value=encoded_image_tokens, key_padding_mask=key_padding_mask)
+
+        x = x + self.ffn(self.norm3(x))
+        return x
+
+
 class Encoder(nn.Module):
     """pre-LN Transformer Encoder"""
 
     def __init__(self, config: DETRConfig):
         super().__init__()
         self.config = config
-        self.layer = nn.ModuleList([EncoderLayer(config) for _ in range(config.num_enc_layers)])
+        self.layers = nn.ModuleList([EncoderLayer(config) for _ in range(config.num_encoder_layers)])
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, x: torch.Tensor, position_embedding: torch.Tensor, key_padding_mask: torch.BoolTensor):
-        for layer in self.layer:
+        for layer in self.layers:
             x = layer(x, position_embedding, key_padding_mask)
         return self.norm(x)
 
