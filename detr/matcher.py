@@ -1,5 +1,6 @@
 """
-Modules to compute the matching cost and solve the corresponding LSAP.
+HungarianMatcher implementation adapted from
+https://github.com/facebookresearch/detr/blob/main/models/matcher.py
 """
 
 from typing import List
@@ -22,83 +23,77 @@ class HungarianMatcher(nn.Module):
     """
 
     def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1):
-        """Creates the matcherfrom torchvision.tv_tensors import BoundingBoxFormat
-        from torchvision.transforms.v2.functional import convert_bounding_box_format
+        """
+        Creates the matcher.
 
-                Params:
-                    cost_class: This is the relative weight of the classification error in the matching cost
-                    cost_bbox: This is the relative weight of the L1 error of the bounding box coordinates in the matching cost
-                    cost_giou: This is the relative weight of the giou loss of the bounding box in the matching cost
+        Params:
+            cost_class: This is the relative weight of the classification error in the matching cost.
+            cost_bbox: This is the relative weight of the L1 error of the bounding box coordinates in the matching cost.
+            cost_giou: This is the relative weight of the giou loss of the bounding box in the matching cost.
         """
         super().__init__()
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
-        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
+        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs can't be 0"
 
     @torch.no_grad()
     def forward(
         self,
-        pred_logits: torch.Tensor,
-        pred_boxes: torch.Tensor,
-        gt_labels: List[torch.Tensor],
-        gt_boxes: List[torch.Tensor],
+        batch_pred_logits: torch.Tensor,
+        batch_pred_boxes: torch.Tensor,
+        batch_gt_labels: List[torch.Tensor],
+        batch_gt_boxes: List[torch.Tensor],
     ):
-        """Performs the matching
-
-        gt_boxes are normalized to [0,1]
+        """
+        Performs the matching.
 
         Params:
-            outputs: This is a dict that contains at least these entries:
-                 "pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
-                 "pred_boxes": Tensor of dim [batch_size, num_queries, 4] with the predicted box coordinates
-
-            targets: This is a list of targets (len(targets) = batch_size), where each target is a dict containing:
-                 "labels": Tensor of dim [num_target_boxes] (where num_target_boxes is the number of ground-truth
-                           objects in the image) containing the class labels
-                 "boxes": Tensor of dim [num_target_boxes, 4] containing the target box coordinates
+            batch_pred_logits: Tensor of dim [batch_size, num_queries, num_classes] with the classification logits.
+            batch_pred_boxes: Tensor of dim [batch_size, num_queries, 4] with the predicted box coordinates.
+            batch_gt_labels: List of Tensors of dim [num_target_boxes] (where num_target_boxes is the number of ground-truth
+                             objects in the image) containing the class labels.
+            batch_gt_boxes: List of Tensors of dim [num_target_boxes, 4] containing the target box coordinates.
+                            gt_boxes are normalized to [0,1].
 
         Returns:
             A list of size batch_size, containing tuples of (index_i, index_j) where:
-                - index_i is the indices of the selected predictions (in order)
-                - index_j is the indices of the corresponding selected targets (in order)
+                - index_i is the indices of the selected predictions (in order).
+                - index_j is the indices of the corresponding selected gt box (in order).
             For each batch element, it holds:
-                len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
+                len(index_i) = len(index_j) = min(num_queries, num_target_boxes).
         """
-        bs, num_queries = pred_logits.shape[:2]
-        num_gt_boxes = [len(x) for x in gt_boxes]
+        batch_pred_probs = batch_pred_logits.softmax(-1)
 
-        # We flatten to compute the cost matrices in a batch
-        pred_probs = pred_logits.flatten(0, 1).softmax(-1)  # [batch_size * num_queries, num_classes]
-        pred_boxes = pred_boxes.flatten(0, 1)  # [batch_size * num_queries, 4]
+        assignments = []
+        for pred_probs, pred_boxes, gt_labels, gt_boxes in zip(
+            batch_pred_probs, batch_pred_boxes, batch_gt_labels, batch_gt_boxes
+        ):
+            # pred_probs shape [num_queries, num_classes]
+            # pred_boxes shape [num_queries, 4]
+            # gt_labels shape [num_gt_boxes]
+            # gt_boxes shape [num_gt_boxes, 4]
 
-        # Also concat the target labels and boxes
-        gt_labels = torch.cat(gt_labels)
-        gt_boxes = torch.cat(gt_boxes)
+            # Compute the classification cost. Contrary to the loss, we don't use the NLL,
+            # but approximate it in 1 - proba[target class].
+            # The 1 is a constant that doesn't change the matching, it can be ommitted.
+            cost_class = -pred_probs[:, gt_labels]
 
-        # Compute the classification cost. Contrary to the loss, we don't use the NLL,
-        # but approximate it in 1 - proba[target class].
-        # The 1 is a constant that doesn't change the matching, it can be ommitted.
-        cost_class = -pred_probs[:, gt_labels]  # [batch_size * num_queries, sum(num_gt_boxes)]
+            # Compute the L1 cost between boxes
+            # each box is represented by 4 values (center_x, center_y, w, h), each in range [0, 1]
+            # so the maximum cost value between two boxes is 4
+            gt_boxes_cxcywh = convert_bounding_box_format(gt_boxes, BoundingBoxFormat.XYXY, BoundingBoxFormat.CXCYWH)
+            cost_bbox = torch.cdist(pred_boxes, gt_boxes_cxcywh, p=1)
 
-        # Compute the L1 cost between boxes
-        # each box is represented by 4 values (center_x, center_y, w, h), each in range [0, 1]
-        # so the maximum cost value between two boxes is 4
-        gt_boxes_cxcywh = convert_bounding_box_format(gt_boxes, BoundingBoxFormat.XYXY, BoundingBoxFormat.CXCYWH)
-        cost_bbox = torch.cdist(pred_boxes, gt_boxes_cxcywh, p=1)  # [batch_size * num_queries, sum(num_gt_boxes)]
+            # GIOU in range (-1, 1]. cost_giou = -GIOU [-1, 1), typically GIOU_loss = 1 - GIOU in range [0, 2).
+            pred_boxes_xyxy = convert_bounding_box_format(pred_boxes, BoundingBoxFormat.CXCYWH, BoundingBoxFormat.XYXY)
+            cost_giou = -generalized_box_iou(pred_boxes_xyxy, gt_boxes)
 
-        # GIOU in range (-1, 1]. cost_giou = -GIOU [-1, 1), typically GIOU_loss = 1 - GIOU in range [0, 2).
-        pred_boxes_xyxy = convert_bounding_box_format(pred_boxes, BoundingBoxFormat.CXCYWH, BoundingBoxFormat.XYXY)
-        # [batch_size * num_queries, sum(num_gt_boxes)]
-        cost_giou = -generalized_box_iou(pred_boxes_xyxy, gt_boxes)
+            # shape [num_queries, num_gt_boxes]
+            cost_matrix = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+            indices = linear_sum_assignment(cost_matrix.cpu())
+            pred_indices = torch.as_tensor(indices[0], dtype=torch.long)
+            gt_indices = torch.as_tensor(indices[1], dtype=torch.long)
+            assignments.append((pred_indices, gt_indices))
 
-        # Final cost matrix [batch_size * num_queries, sum(num_gt_boxes)]
-        cost_matrix = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
-        # Final cost matrix [batch_size, num_queries, sum(num_gt_boxes)]
-        cost_matrix = cost_matrix.view(bs, num_queries, -1).cpu()
-
-        # split cost matrix into [batch_size, num_queries, image1_gt_boxes], [batch_size, num_queries, image2_gt_boxes], ...
-        cost_matrices = cost_matrix.split(num_gt_boxes, -1)
-        indices = [linear_sum_assignment(c[i]) for i, c in enumerate(cost_matrices)]
-        # indices is a list of tuples of (row, col) where row is the index of the prediction and col is the index of the gt_box
-        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
+        return assignments

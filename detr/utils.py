@@ -76,6 +76,9 @@ def generalized_box_iou(boxes1, boxes2):
 
     Returns a [N, M] pairwise matrix, where N = len(boxes1)
     and M = len(boxes2)
+
+    source implementation
+    https://github.com/facebookresearch/detr/blob/main/util/box_ops.py
     """
     # degenerate boxes gives inf / nan results
     # so do an early check
