@@ -24,6 +24,7 @@ class DETRConfig:
     ffn_scale_factor: int = 8  # 256x8 = 2048
     hidden_dropout_prob: float = 0.1
     attention_probs_dropout_prob: float = 0.1
+    box_embedding_mlp_num_layers: int = 3
 
     initializer_range: float = 0.02
     layer_norm_eps: float = 1e-5
@@ -46,7 +47,27 @@ class DETR(nn.Module):
         self.decoder = Decoder(config)
 
         self.class_embedding = nn.Linear(config.hidden_size, config.num_classes + 1)
-        self.bbox_embedding = MLP(config.hidden_size, config.hidden_size, output_dim=4, num_layers=3)
+        self.bbox_embedding = MLP(
+            config.hidden_size,
+            config.hidden_size,
+            output_dim=4,
+            num_layers=config.box_embedding_mlp_num_layers,
+            initializer_range=config.initializer_range,
+        )
+
+        # Initialize weights
+        # Balances variance between the backbone’s high channel count (e.g., 2048) and hidden_dim (e.g., 256)
+        # Compatible with GeLU’s smoother profile (less need for ReLU’s aggressive scaling).
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.zeros_(self.input_proj.bias)
+
+        # Reduce the scale of the initial object query embeddings, which could prevent
+        # overly large initial output
+        nn.init.normal_(self.object_query_embedding.weight, mean=0.0, std=config.initializer_range)
+        # Xavier is a standard choice for linear layers producing logits,
+        # ensuring balanced variance and compatibility with DETR’s cross-entropy loss.
+        nn.init.xavier_uniform_(self.class_embedding.weight)
+        nn.init.zeros_(self.class_embedding.bias)
 
     def forward(self, images: torch.Tensor, heights: torch.Tensor, widths: torch.Tensor):
         x = self.backbone(images)
@@ -70,8 +91,11 @@ class DETR(nn.Module):
             position_embedding=pos_embd,
             object_query_embedding=query_embed,
             key_padding_mask=image_padding_mask,
-        )
-        return decoded_object_queries
+        )  # (B, 100, 256)
+
+        outputs_class = self.class_embedding(decoded_object_queries)
+        outputs_coord = self.bbox_embedding(outputs_class).sigmoid()
+        return {"pred_logits": outputs_class, "pred_boxes": outputs_coord}
 
     def make_image_padding_mask(
         self,
@@ -102,6 +126,17 @@ class Decoder(nn.Module):
         self.config = config
         self.layers = nn.ModuleList([DecoderLayer(config) for _ in range(config.num_decoder_layers)])
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # suitable for GeLU activation
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.weight.data.fill_(1.0)
+            module.bias.data.zero_()
 
     def forward(
         self,
@@ -157,6 +192,17 @@ class Encoder(nn.Module):
         self.config = config
         self.layers = nn.ModuleList([EncoderLayer(config) for _ in range(config.num_encoder_layers)])
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # suitable for GeLU activation
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.weight.data.fill_(1.0)
+            module.bias.data.zero_()
 
     def forward(self, x: torch.Tensor, position_embedding: torch.Tensor, key_padding_mask: torch.BoolTensor):
         for layer in self.layers:
@@ -312,9 +358,16 @@ class ScaledDotProductAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """Very simple multi-layer perceptron"""
+    """
+    Very simple multi-layer perceptron
+    The original DETR implementation used the ReLU activation function, which
+    mirrors the original Transformer implementation. However, the GeLU activation
+    function has been shown to be more effective by more recent Transformer models.
+    """
 
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int):
+    def __init__(
+        self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int, initializer_range: float = 0.02
+    ):
         super().__init__()
         layers = []
         for i in range(num_layers):
@@ -322,8 +375,19 @@ class MLP(nn.Module):
             out_dim = output_dim if i == num_layers - 1 else hidden_dim
             layers.append(nn.Linear(in_dim, out_dim))
             if i < num_layers - 1:
-                layers.append(nn.ReLU())
+                layers.append(nn.GELU(approximate="tanh"))
+
         self.net = nn.Sequential(*layers)
+
+        self.initializer_range = initializer_range
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # Common in GeLU models
+            nn.init.normal_(module.weight, mean=0, std=self.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
 
     def forward(self, x):
         return self.net(x)
@@ -335,7 +399,6 @@ class FFN(nn.Module):
 
     Args:
         config: DETRConfig
-            Configuration for the BERT model.
     """
 
     def __init__(self, config):
