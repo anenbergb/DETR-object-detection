@@ -72,7 +72,7 @@ class DETR(nn.Module):
     def forward(self, images: torch.Tensor, heights: torch.Tensor, widths: torch.Tensor):
         x = self.backbone(images)
         x = self.input_proj(x)
-        B, C, H, W = x.shape
+        B, _, H, W = x.shape
         pos_embd = self.position_embedding(H, W, heights, widths, self.backbone.scale)  # (B,256,feat_height,feat_width)
         image_padding_mask = self.make_image_padding_mask(
             H, W, heights, widths, self.backbone.scale
@@ -94,7 +94,7 @@ class DETR(nn.Module):
         )  # (B, 100, 256)
 
         outputs_class = self.class_embedding(decoded_object_queries)
-        outputs_coord = self.bbox_embedding(outputs_class).sigmoid()
+        outputs_coord = self.bbox_embedding(decoded_object_queries).sigmoid()
         return {"pred_logits": outputs_class, "pred_boxes": outputs_coord}
 
     def make_image_padding_mask(
@@ -146,10 +146,13 @@ class Decoder(nn.Module):
         key_padding_mask: torch.BoolTensor,
     ):
         x = torch.zeros_like(object_query_embedding)
+        outputs = []
         for layer in self.layers:
             x = layer(x, encoded_image_tokens, object_query_embedding, position_embedding, key_padding_mask)
-        # Consider returning intermediates
-        return self.norm(x)
+            outputs.append(self.norm(x))
+
+        output = torch.stack(outputs, dim=1)  # (B, len(layers), 100, 256)
+        return output
 
 
 class DecoderLayer(nn.Module):
