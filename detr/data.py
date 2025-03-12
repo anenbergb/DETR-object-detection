@@ -117,7 +117,7 @@ class CocoDataset(torch.utils.data.Dataset):
         """
         target contains:
             "image_id": int
-            "boxes": torch.tensor (N,4)
+            "boxes": torch.tensor (N,4) XYXY format
             "labels": torch.tensor (N,)
 
         updates the target to include:
@@ -212,6 +212,14 @@ def get_collate_function(divisible_by: int = 32):
         label_names = ["boxes", "class_idx", "class_id", "iscrowd"]
         for label_name in label_names:
             batch[label_name] = [x[label_name] for x in targets]
+
+        batch["boxes_normalized"] = []
+        for height, width, boxes in zip(batch["height"], batch["width"], batch["boxes"]):
+            copied = boxes.clone()
+            copied[..., [0, 2]] /= width
+            copied[..., [1, 3]] /= height
+            batch["boxes_normalized"].append(copied)
+
         return batch
 
     return collate_function
