@@ -12,24 +12,20 @@ from detr.position_encoding import PositionalEncoding
 
 @dataclass
 class DETRConfig:
-    backbone: str = "resnet50"
-    # positional encoding
-    temperature: int = 10000
-
-    num_object_queries: int = 100
-    num_encoder_layers: int = 6
-    num_decoder_layers: int = 6
-    num_attention_heads: int = 8
-    hidden_size: int = 256
-    ffn_scale_factor: int = 8  # 256x8 = 2048
-    hidden_dropout_prob: float = 0.1
-    attention_probs_dropout_prob: float = 0.1
-    box_embedding_mlp_num_layers: int = 3
-
-    initializer_range: float = 0.02
-    layer_norm_eps: float = 1e-5
-
-    num_classes: int = 80
+    backbone: str = field(default="resnet50")
+    temperature: int = field(default=10000)  # positional encoding
+    num_object_queries: int = field(default=100)
+    num_encoder_layers: int = field(default=6)
+    num_decoder_layers: int = field(default=6)
+    num_attention_heads: int = field(default=8)
+    hidden_size: int = field(default=256)
+    ffn_scale_factor: int = field(default=8)  # 256x8 = 2048
+    hidden_dropout_prob: float = field(default=0.1)
+    attention_probs_dropout_prob: float = field(default=0.1)
+    box_embedding_mlp_num_layers: int = field(default=3)
+    initializer_range: float = field(default=0.02)
+    layer_norm_eps: float = field(default=1e-5)
+    num_classes: int = field(default=80)
 
 
 class DETR(nn.Module):
