@@ -13,6 +13,15 @@ from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration, gather_object
 from safetensors.torch import load_model
 
+from detr.model import DETR, DETRConfig
+from detr.data import (
+    CocoDataset,
+    get_val_transforms,
+    get_train_transforms,
+    get_collate_function,
+)
+from detr.matcher import HungarianMatcher
+from detr.loss import SetCriterion
 
 @dataclass
 class TrainingConfig:
@@ -24,7 +33,9 @@ class TrainingConfig:
 
     coco_dataset_root: str = field(default="/media/bryan/ssd01/fiftyone/coco-2017")
 
-    train_batch_size: int = field(default=8)  # total should be 64
+    # the train batch size used in the paper when training across multiple GPUs
+    cumulative_train_batch_size: int = field(default=64)
+    train_batch_size: int = field(default=8)
     val_batch_size: int = field(default=16)
 
     epochs: int = field(default=100)
@@ -79,15 +90,14 @@ class TrainingConfig:
     set_cost_giou: float = field(default=2)
 
     # Loss coefficients
+    label_ce_loss_coef: float = field(default=1)
     bbox_loss_coef: float = field(default=5)
     giou_loss_coef: float = field(default=2)
     # Relative classification weight of the no-object class
     eos_coef: float = field(default=0.1)
 
 
-def train_DETR(config: TrainingConfig):
-    num_anchors_per_scale = len(config.anchors) // len(config.scales)
-    assert len(config.anchors) % len(config.scales) == 0
+def train_DETR(config: TrainingConfig, detr_config: DETRConfig):
 
     project_config = ProjectConfiguration(
         project_dir=config.output_dir,
@@ -97,16 +107,23 @@ def train_DETR(config: TrainingConfig):
         save_on_each_node=False,
         iteration=config.start_epoch,  # the current save iteration
     )
+    gradient_accumulation_steps = config.cumulative_train_batch_size // config.train_batch_size
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         log_with="tensorboard",
         project_config=project_config,
         step_scheduler_with_optimizer=False,
         split_batches=False,
+        gradient_accumulation_steps=gradient_accumulation_steps,
     )
     if accelerator.is_main_process:
         os.makedirs(config.output_dir, exist_ok=True)
         accelerator.init_trackers(os.path.basename(config.output_dir))
+        accelerator.print(
+            f"Gradient Accumulation steps: {gradient_accumulation_steps}. "
+            f"To achieve a cumulative batch size of {config.cumulative_train_batch_size} "
+            f"given a per-GPU batch size of {config.train_batch_size}"
+        )
 
     # logger = get_logger(__name__, log_level="DEBUG")
     # logger.info("INFO LEVEL", main_process_only=True)
@@ -115,32 +132,12 @@ def train_DETR(config: TrainingConfig):
     train_dataset = CocoDataset(
         dataset_root=config.coco_dataset_root,
         split="train",
-        transform=get_train_transforms(resize_size=config.image_size),
+        transform=get_train_transforms(),
     )
     val_dataset = CocoDataset(
         dataset_root=config.coco_dataset_root,
         split="validation",
-        transform=get_val_transforms(resize_size=config.image_size),
-    )
-
-    collate_instance = CollateWithAnchors(
-        config.anchors,
-        config.scales,
-        config.image_size,
-        config.image_size,
-        num_anchors_per_scale=num_anchors_per_scale,
-        num_classes=train_dataset.num_classes,
-    )
-
-    detection_decoder = DecodeDetections(
-        config.anchors,
-        config.scales,
-        config.image_size,
-        config.image_size,
-        class_names=train_dataset.class_names,
-        num_anchors_per_scale=num_anchors_per_scale,
-        box_min_size=config.box_min_size,
-        box_min_area=config.box_min_area,
+        transform=get_val_transforms(),
     )
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -150,7 +147,7 @@ def train_DETR(config: TrainingConfig):
         pin_memory=True,
         drop_last=True,
         num_workers=config.num_workers,
-        collate_fn=collate_instance,
+        collate_fn=get_collate_function(),
     )
     val_dataloader = torch.utils.data.DataLoader(
         val_dataset,
@@ -159,39 +156,63 @@ def train_DETR(config: TrainingConfig):
         pin_memory=True,
         drop_last=False,
         num_workers=config.num_workers,
-        collate_fn=collate_instance,
+        collate_fn=get_collate_function(),
     )
+    detr_config.num_classes = train_dataset.num_classes
 
-    model = Yolo(
-        train_dataset.num_classes,
-        num_anchors_per_scale,
-        backbone_name=config.torchvision_backbone_name,
-    )
+    model = DETR(detr_config)
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    accelerator.print(f"number of params: {n_parameters}")
+    param_groups = [
+        {
+            "params": [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad],
+            "lr": args.lr_backbone, # ResNet-50 backbone with lower initial learning rate
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad],
+            "lr": args.lr, # Transformer with higher initial learning rate
+        },
 
-    parameters = set_weight_decay(
-        model,
-        config.weight_decay,
-        norm_weight_decay=config.norm_weight_decay,
-    )
+    ]
+    optimizer = torch.optim.AdamW(param_groups, lr=config.lr, weight_decay=config.weight_decay)
 
-    optimizer = torch.optim.AdamW(parameters, lr=config.lr, weight_decay=config.weight_decay)
+    for i, param_group in enumerate(optimizer.param_groups):
+        accelerator.print(f"Parameter group {i}, initial learning rate: {param_group['lr']}")
 
+    # 1. Warmup scheduler: Linear increase to max learning rate
     scheduler1 = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=config.lr_warmup_decay,
         total_iters=config.lr_warmup_epochs,
     )
-    scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.epochs - config.lr_warmup_epochs, eta_min=config.lr_min
+    # 2. Constant LR scheduler: Keep learning rate fixed
+    scheduler2 = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda epoch: 1.0 # Multiplier of 1.0 to keep the LR constant
+    )
+    # 3. Cosine annealing scheduler: Gradually decrease learning rate
+    cooldown_epochs = config.epochs - config.lr_warmup_epochs - config.lr_hold_max_epochs
+    scheduler3 = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=cooldown_epochs,
+        eta_min=config.lr_min
     )
     scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, [scheduler1, scheduler2], milestones=[config.lr_warmup_epochs]
+        optimizer,
+        schedulers = [scheduler1, scheduler2, scheduler3],
+        milestones=[config.lr_warmup_epochs, config.lr_warmup_epochs + config.lr_hold_max_epochs],
     )
 
-    yololoss = YoloLoss(label_smoothing=config.label_smoothing)
+    matcher = HungarianMatcher(
+        cost_class = config.set_cost_class, cost_bbox = config.set_cost_bbox, cost_giou = config.set_cost_giou)
+    criterion = SetCriterion(train_dataset.num_classes, matcher,
+            weight_label_ce=config.label_ce_loss_coef,
+            weight_bbox_l1=config.bbox_loss_coef,
+            weight_bbox_giou=config.giou_loss_coef,
+            eos_coef=config.eos_coef)
 
-    model, optimizer, train_dataloader, val_dataloader, scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, val_dataloader, scheduler
+    model, optimizer, criterion, train_dataloader, val_dataloader, scheduler = accelerator.prepare(
+        model, optimizer, criterion, train_dataloader, val_dataloader, scheduler
     )
 
     # ONLY load the model weights from the checkpoint. Leave the optimizer and scheduler as is.
@@ -199,13 +220,13 @@ def train_DETR(config: TrainingConfig):
         model_fpath = os.path.join(config.resume_from_checkpoint, "model.safetensors")
         assert os.path.exists(model_fpath), f"Model file {model_fpath} not found"
         accelerator.print(f"Loading model weights from {model_fpath}")
-        weights_before = model.module.body.conv1.weight.detach().clone()
+        weights_before = model.input_proj.weight.detach().clone()
         load_model(
             accelerator._models[0],
             model_fpath,
             device=str(accelerator.device),
         )
-        weight_after = model.module.body.conv1.weight.detach().clone()
+        weight_after = model.input_proj.weight.detach().clone()
         assert not torch.allclose(
             weights_before, weight_after
         ), "Model weights did not change after loading from checkpoint"
@@ -217,7 +238,6 @@ def train_DETR(config: TrainingConfig):
 
     global_step = 0
     for epoch in range(config.start_epoch, config.epochs):
-        total_loss = 0
         model.train()
         for step, batch in (
             progress_bar := tqdm(
@@ -230,26 +250,27 @@ def train_DETR(config: TrainingConfig):
             if config.limit_train_iters > 0 and step >= config.limit_train_iters:
                 break
 
-            optimizer.zero_grad()
-
-            outputs = model(batch["image"])
-            with accelerator.autocast():
-                loss_dict = yololoss(outputs, batch)
-                loss = loss_dict["loss"]
-
-            total_loss += loss.detach().item()
-            accelerator.backward(loss)
-
+            with accelerator.accumulate(model):  # accumulate gradients into model.grad attributes
+                with accelerator.autocast():
+                    outputs = model(batch["image"], batch["height"], batch["width"])
+                    loss_dict = criterion(outputs, batch)
+                    loss = sum(loss_dict[k] for k in loss_dict.keys() if k.startswith("loss"))
+                accelerator.backward(loss)  # accumulates gradients
+            
             accelerator.clip_grad_norm_(model.parameters(), config.gradient_max_norm)
             optimizer.step()
+            optimizer.zero_grad()
+            accelerator.backward(loss)
 
-            current_lr = scheduler.get_last_lr()[0]
+            backbone_lr, transformer_lr = scheduler.get_last_lr()
             logs = {
                 "loss/train": loss.detach().item(),
-                "lr": current_lr,
+                "lr/backbone": backbone_lr,
+                "lr/transformer": transformer_lr,
                 "epoch": epoch,
             }
             progress_bar.set_postfix(**logs)
+            
             logs["loss-objectness/train"] = loss_dict["objectness_loss"].detach().item()
             logs["loss-classification/train"] = loss_dict["class_loss"].detach().item()
             logs["loss-coordinates/train"] = loss_dict["coordinates_loss"].detach().item()
@@ -489,5 +510,6 @@ if __name__ == "__main__":
         eval_only=args.eval_only,
         eval_epochs=args.eval_epochs,
     )
-
-    sys.exit(train_DETR(config))
+    # optionally overwrite DETR model parameters
+    detr_config = DETRConfig()
+    sys.exit(train_DETR(config, detr_config))
