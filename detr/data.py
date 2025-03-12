@@ -140,7 +140,7 @@ class CocoDataset(torch.utils.data.Dataset):
 
         class_ids = target.pop("labels")
         # target["class_name"] = [self.class_id2name[id.item()] for id in class_ids]
-        target["class_idx"] = torch.tensor([self.class_id2idx[id.item()] for id in class_ids])
+        target["class_idx"] = torch.tensor([self.class_id2idx[id.item()] for id in class_ids], dtype=torch.long)
         target["class_id"] = class_ids
         target["iscrowd"] = torch.tensor(target["iscrowd"], dtype=torch.bool)
         if self.transform:

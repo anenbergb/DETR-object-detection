@@ -110,11 +110,13 @@ class SetCriterion(nn.Module):
             The cardinality error.
         """
         device = pred_logits.device
-        num_gt_boxes = torch.as_tensor([len(gt_labels) for gt_labels in batch_gt_labels], device=device)
+        num_gt_boxes = torch.as_tensor(
+            [len(gt_labels) for gt_labels in batch_gt_labels], device=device, dtype=torch.float
+        )
         no_object_class = pred_logits.shape[-1] - 1
-        pred_class = pred_logits.argmax(-1)
-        card_pred = (pred_class != no_object_class).sum(1)
-        return torch.nn.functional.l1_loss(card_pred.float(), num_gt_boxes.float())
+        pred_class = pred_logits.argmax(-1)  # [batch_size, num_queries]
+        card_pred = (pred_class != no_object_class).sum(1).float()  # [batch_size]
+        return torch.nn.functional.l1_loss(card_pred, num_gt_boxes)
 
     def loss_boxes(
         self,

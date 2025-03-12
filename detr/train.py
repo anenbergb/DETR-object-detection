@@ -168,11 +168,11 @@ def train_DETR(config: TrainingConfig, detr_config: DETRConfig):
     param_groups = [
         {
             "params": [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad],
-            "lr": args.lr_backbone,  # ResNet-50 backbone with lower initial learning rate
+            "lr": config.lr_backbone,  # ResNet-50 backbone with lower initial learning rate
         },
         {
             "params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad],
-            "lr": args.lr,  # Transformer with higher initial learning rate
+            "lr": config.lr,  # Transformer with higher initial learning rate
         },
     ]
     optimizer = torch.optim.AdamW(param_groups, lr=config.lr, weight_decay=config.weight_decay)
@@ -260,7 +260,6 @@ def train_DETR(config: TrainingConfig, detr_config: DETRConfig):
             accelerator.clip_grad_norm_(model.parameters(), config.gradient_max_norm)
             optimizer.step()
             optimizer.zero_grad()
-            accelerator.backward(loss)
 
             backbone_lr, transformer_lr = scheduler.get_last_lr()
             logs = {
@@ -322,12 +321,13 @@ def format_loss_for_logging(loss_dict, split="train"):
 
         logs[f"loss/{name}_by_decoder_layer"] = loss_by_layer
 
-    logs["cardinality_error"] = {split: loss_dict["cardinality_error"]}
+    name = "error in number of object predictions"
+    logs[f"{name}/cardinality_error"] = {split: loss_dict["cardinality_error"]}
     error_by_layer = {}
     for k, v in loss_dict.items():
         if k.startswith("cardinality_error"):
             error_by_layer[k] = v
-    logs["cardinality_error_by_decoder_layer"] = error_by_layer
+    logs[f"{name}/cardinality_error_by_decoder_layer"] = error_by_layer
 
     logs["class_error"] = {split: loss_dict["class_error"]}
     return logs
