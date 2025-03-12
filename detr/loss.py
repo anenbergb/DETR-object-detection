@@ -1,8 +1,16 @@
+"""
+SetCriterion implementation adapted from
+https://github.com/facebookresearch/detr/blob/main/models/detr.py
+"""
+
 from typing import List, Tuple
 import torch
 from torch import nn
 
-from detr.utils import accuracy
+from detr.matcher import HungarianMatcher
+from detr.utils import accuracy, generalized_box_iou
+from torchvision.tv_tensors import BoundingBoxFormat
+from torchvision.transforms.v2.functional import convert_bounding_box_format
 
 
 class SetCriterion(nn.Module):
@@ -12,7 +20,15 @@ class SetCriterion(nn.Module):
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
 
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef):
+    def __init__(
+        self,
+        num_classes: int,
+        matcher: HungarianMatcher,
+        weight_label_ce: float = 1.0,
+        weight_bbox_l1: float = 5.0,
+        weight_bbox_giou: float = 2.0,
+        eos_coef=0.1,
+    ):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -23,7 +39,9 @@ class SetCriterion(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.matcher = matcher
-        self.weight_dict = weight_dict
+        self.weight_label_ce = weight_label_ce
+        self.weight_bbox_l1 = weight_bbox_l1
+        self.weight_bbox_giou = weight_bbox_giou
         self.eos_coef = eos_coef
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[-1] = self.eos_coef
@@ -68,77 +86,83 @@ class SetCriterion(nn.Module):
         # make the assignment of the correct ground truth class label to the predicted class label
         target_classes[idx] = target_classes_o
 
-        pred_logits = pred_logits.flatten(0, 1)  # (batch_size * num_queries, num_classes + 1)
-        target_classes = target_classes.flatten()  # (batch_size * num_queries,)
+        pred_logits_flat = pred_logits.flatten(0, 1)  # (batch_size * num_queries, num_classes + 1)
+        target_classes_flat = target_classes.flatten()  # (batch_size * num_queries,)
 
-        loss = torch.nn.functional.cross_entropy(pred_logits, target_classes, self.empty_weight)
+        loss = torch.nn.functional.cross_entropy(pred_logits_flat, target_classes_flat, self.empty_weight)
+        loss *= self.weight_label_ce
         if include_class_error:
             class_error = 100 - accuracy(pred_logits[idx], target_classes_o)[0]
             return loss, class_error
         return loss
 
-    # @torch.no_grad()
-    # def loss_cardinality(self, outputs, targets, indices, num_boxes):
-    #     """Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
-    #     This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
-    #     """
-    #     pred_logits = outputs["pred_logits"]
-    #     device = pred_logits.device
-    #     tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
-    #     # Count the number of predictions that are NOT "no-object" (which is the last class)
-    #     card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
-    #     card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
-    #     losses = {"cardinality_error": card_err}
-    #     return losses
+    @torch.no_grad()
+    def loss_cardinality(
+        self,
+        pred_logits: torch.Tensor,
+        batch_gt_labels: List[torch.Tensor],
+    ):
+        """
+        Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
+        This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
 
-    # def loss_boxes(self, outputs, targets, indices, num_boxes):
-    #     """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
-    #     targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
-    #     The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
-    #     """
-    #     assert "pred_boxes" in outputs
-    #     idx = self._get_src_permutation_idx(indices)
-    #     src_boxes = outputs["pred_boxes"][idx]
-    #     target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        pred_logits shape [batch_size, num_queries, num_classes + 1]
 
-    #     loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
+        gt_labels shape List[ [num_gt_boxes] ]
+        """
+        device = pred_logits.device
+        num_gt_boxes = torch.as_tensor([len(gt_labels) for gt_labels in batch_gt_labels], device=device)
 
-    #     losses = {}
-    #     losses["loss_bbox"] = loss_bbox.sum() / num_boxes
+        # Count the number of predictions that are NOT "no-object" (which is the last class)
+        no_object_class = pred_logits.shape[-1] - 1
+        pred_class = pred_logits.argmax(-1)  # (batch_size, num_queries)
+        card_pred = (pred_class != no_object_class).sum(1)  # (batch_size,)
+        return torch.nn.functional.l1_loss(card_pred.float(), num_gt_boxes.float())
 
-    #     loss_giou = 1 - torch.diag(
-    #         box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(src_boxes), box_ops.box_cxcywh_to_xyxy(target_boxes))
-    #     )
-    #     losses["loss_giou"] = loss_giou.sum() / num_boxes
-    #     return losses
+    def loss_boxes(
+        self,
+        pred_boxes: torch.Tensor,
+        batch_gt_boxes: List[torch.Tensor],
+        indices: List[Tuple[torch.Tensor, torch.Tensor]],
+    ):
+        """
+        Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+        targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+        The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
 
-    # def loss_masks(self, outputs, targets, indices, num_boxes):
-    #     """Compute the losses related to the masks: the focal loss and the dice loss.
-    #     targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
-    #     """
-    #     assert "pred_masks" in outputs
+        pred_boxes shape [batch_size, num_queries, 4]
+        gt_boxes shape List[ [num_gt_boxes, 4] ]
 
-    #     src_idx = self._get_src_permutation_idx(indices)
-    #     tgt_idx = self._get_tgt_permutation_idx(indices)
-    #     src_masks = outputs["pred_masks"]
-    #     src_masks = src_masks[src_idx]
-    #     masks = [t["masks"] for t in targets]
-    #     # TODO use valid to mask invalid areas due to padding in loss
-    #     target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
-    #     target_masks = target_masks.to(src_masks)
-    #     target_masks = target_masks[tgt_idx]
 
-    #     # upsample predictions to the target size
-    #     src_masks = interpolate(src_masks[:, None], size=target_masks.shape[-2:], mode="bilinear", align_corners=False)
-    #     src_masks = src_masks[:, 0].flatten(1)
+        """
+        total_num_gt_boxes = max(sum([len(gt_boxes) for gt_boxes in batch_gt_boxes]), 1)
 
-    #     target_masks = target_masks.flatten(1)
-    #     target_masks = target_masks.view(src_masks.shape)
-    #     losses = {
-    #         "loss_mask": sigmoid_focal_loss(src_masks, target_masks, num_boxes),
-    #         "loss_dice": dice_loss(src_masks, target_masks, num_boxes),
-    #     }
-    #     return losses
+        # batch_idx of shape (total_num_gt_boxes,), src_idx of shape (total_num_gt_boxes,)
+        # e.g. batch_idx = [0, 0, 0, 1, 1, 1, 2, 2, 2, ...]
+        # e.g. src_idx = [1,6,8,, ...]
+        idx = self._get_src_permutation_idx(indices)
+
+        # (batch_size, num_queries, 4) -> (total_num_gt_boxes, 4)
+        src_boxes = pred_boxes[idx]
+
+        # (total_num_gt_boxes, 4)
+        target_boxes = torch.cat(
+            [gt_boxes[gt_box_indices] for gt_boxes, (_, gt_box_indices) in zip(batch_gt_boxes, indices)], dim=0
+        )
+
+        target_boxes_cxcywh = convert_bounding_box_format(
+            target_boxes, BoundingBoxFormat.XYXY, BoundingBoxFormat.CXCYWH
+        )
+        loss_bbox = torch.nn.functional.l1_loss(src_boxes, target_boxes_cxcywh, reduction="sum") / total_num_gt_boxes
+        loss_bbox *= self.weight_bbox_l1
+
+        src_boxes_xyxy = convert_bounding_box_format(src_boxes, BoundingBoxFormat.CXCYWH, BoundingBoxFormat.XYXY)
+        giou = generalized_box_iou(src_boxes_xyxy, target_boxes)
+        loss_giou = 1 - torch.diag(giou)
+        loss_giou = loss_giou.sum() / total_num_gt_boxes
+        loss_giou *= self.weight_bbox_giou
+
+        return loss_bbox, loss_giou
 
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
@@ -171,8 +195,6 @@ class SetCriterion(nn.Module):
             # boxes_normalized are expected in format XYXY, normalized to range [0, 1]
             indices = self.matcher(pred_logits, pred_boxes, targets["class_idx"], targets["boxes_normalized"])
 
-            num_boxes_across_batch = sum(len(x) for x in targets["class_idx"])
-
             # Compute all the requested losses
             loss_suffix = f"_{i}" if i < num_layers - 1 else ""
             loss_labels = self.loss_labels(
@@ -181,9 +203,9 @@ class SetCriterion(nn.Module):
             if i == num_layers - 1:
                 losses["class_error"] = loss_labels[1]
                 loss_labels = loss_labels[0]
-            losses[f"loss_ce{loss_suffix}"] = loss_labels
-
-            # loss_cardinality
-            # loss_boxes
-
+            losses[f"loss_label_ce{loss_suffix}"] = loss_labels
+            losses[f"cardinality_error{loss_suffix}"] = self.loss_cardinality(pred_logits, targets["class_idx"])
+            losses[f"loss_l1_bbox{loss_suffix}"], losses[f"loss_giou{loss_suffix}"] = self.loss_boxes(
+                pred_boxes, targets["boxes_normalized"], indices
+            )
         return losses
