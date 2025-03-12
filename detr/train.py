@@ -7,6 +7,7 @@ from tqdm import tqdm
 from dataclasses import dataclass, field
 from typing import List, Tuple
 import logging
+from collections import defaultdict
 
 # Huggingface
 from accelerate import Accelerator
@@ -22,12 +23,13 @@ from detr.data import (
 )
 from detr.matcher import HungarianMatcher
 from detr.loss import SetCriterion
+from detr.utils import DetectionMetrics
+
 
 @dataclass
 class TrainingConfig:
     output_dir: str
     overwrite_output_dir: bool = field(default=True)  # overwrite the old model
-    eval_only: bool = field(default=False)
     start_epoch: int = field(default=0)
     resume_from_checkpoint: str = field(default=None)
 
@@ -35,7 +37,7 @@ class TrainingConfig:
 
     # the train batch size used in the paper when training across multiple GPUs
     cumulative_train_batch_size: int = field(default=64)
-    train_batch_size: int = field(default=8)
+    train_batch_size: int = field(default=4)
     val_batch_size: int = field(default=16)
 
     epochs: int = field(default=100)
@@ -166,13 +168,12 @@ def train_DETR(config: TrainingConfig, detr_config: DETRConfig):
     param_groups = [
         {
             "params": [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad],
-            "lr": args.lr_backbone, # ResNet-50 backbone with lower initial learning rate
+            "lr": args.lr_backbone,  # ResNet-50 backbone with lower initial learning rate
         },
         {
             "params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad],
-            "lr": args.lr, # Transformer with higher initial learning rate
+            "lr": args.lr,  # Transformer with higher initial learning rate
         },
-
     ]
     optimizer = torch.optim.AdamW(param_groups, lr=config.lr, weight_decay=config.weight_decay)
 
@@ -187,29 +188,28 @@ def train_DETR(config: TrainingConfig, detr_config: DETRConfig):
     )
     # 2. Constant LR scheduler: Keep learning rate fixed
     scheduler2 = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda epoch: 1.0 # Multiplier of 1.0 to keep the LR constant
+        optimizer, lr_lambda=lambda epoch: 1.0  # Multiplier of 1.0 to keep the LR constant
     )
     # 3. Cosine annealing scheduler: Gradually decrease learning rate
     cooldown_epochs = config.epochs - config.lr_warmup_epochs - config.lr_hold_max_epochs
-    scheduler3 = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=cooldown_epochs,
-        eta_min=config.lr_min
-    )
+    scheduler3 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cooldown_epochs, eta_min=config.lr_min)
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
-        schedulers = [scheduler1, scheduler2, scheduler3],
+        schedulers=[scheduler1, scheduler2, scheduler3],
         milestones=[config.lr_warmup_epochs, config.lr_warmup_epochs + config.lr_hold_max_epochs],
     )
 
     matcher = HungarianMatcher(
-        cost_class = config.set_cost_class, cost_bbox = config.set_cost_bbox, cost_giou = config.set_cost_giou)
-    criterion = SetCriterion(train_dataset.num_classes, matcher,
-            weight_label_ce=config.label_ce_loss_coef,
-            weight_bbox_l1=config.bbox_loss_coef,
-            weight_bbox_giou=config.giou_loss_coef,
-            eos_coef=config.eos_coef)
+        cost_class=config.set_cost_class, cost_bbox=config.set_cost_bbox, cost_giou=config.set_cost_giou
+    )
+    criterion = SetCriterion(
+        train_dataset.num_classes,
+        matcher,
+        weight_label_ce=config.label_ce_loss_coef,
+        weight_bbox_l1=config.bbox_loss_coef,
+        weight_bbox_giou=config.giou_loss_coef,
+        eos_coef=config.eos_coef,
+    )
 
     model, optimizer, criterion, train_dataloader, val_dataloader, scheduler = accelerator.prepare(
         model, optimizer, criterion, train_dataloader, val_dataloader, scheduler
@@ -256,7 +256,7 @@ def train_DETR(config: TrainingConfig, detr_config: DETRConfig):
                     loss_dict = criterion(outputs, batch)
                     loss = sum(loss_dict[k] for k in loss_dict.keys() if k.startswith("loss"))
                 accelerator.backward(loss)  # accumulates gradients
-            
+
             accelerator.clip_grad_norm_(model.parameters(), config.gradient_max_norm)
             optimizer.step()
             optimizer.zero_grad()
@@ -264,16 +264,16 @@ def train_DETR(config: TrainingConfig, detr_config: DETRConfig):
 
             backbone_lr, transformer_lr = scheduler.get_last_lr()
             logs = {
-                "loss/train": loss.detach().item(),
+                "loss": loss.detach().item(),
                 "lr/backbone": backbone_lr,
                 "lr/transformer": transformer_lr,
                 "epoch": epoch,
             }
             progress_bar.set_postfix(**logs)
-            
-            logs["loss-objectness/train"] = loss_dict["objectness_loss"].detach().item()
-            logs["loss-classification/train"] = loss_dict["class_loss"].detach().item()
-            logs["loss-coordinates/train"] = loss_dict["coordinates_loss"].detach().item()
+            logs["loss"] = {"train": loss.detach().item()}
+            for k in loss_dict.keys():
+                loss_dict[k] = loss_dict[k].detach().item()
+            logs.update(format_loss_for_logging(loss_dict, split="train"))
             accelerator.log(logs, step=global_step)
             global_step += 1
 
@@ -285,23 +285,52 @@ def train_DETR(config: TrainingConfig, detr_config: DETRConfig):
             val_metrics = run_validation(
                 accelerator,
                 model,
-                yololoss,
+                criterion,
                 val_dataloader,
-                detection_decoder,
                 limit_val_iters=config.limit_val_iters,
                 global_step=global_step,
             )
-            if accelerator.is_main_process:
-                val_print_str = f"Validation metrics [Epoch {epoch}]: "
-                AP = val_metrics.get("AP", 0.0)
-                AP50 = val_metrics.get("AP50", 0.0)
-                AP_person = val_metrics.get("AP-per-class/person", 0.0)
-                AP_cat = val_metrics.get("AP-per-class/cat", 0.0)
-                val_print_str += f"AP: {AP:.3f} AP50: {AP50:.3f} AP-person: {AP_person:.3f} AP-cat: {AP_cat:.3f}"
-                accelerator.print(val_print_str)
-                accelerator.log(val_metrics, step=global_step)
+            # if accelerator.is_main_process:
+            #     val_print_str = f"Validation metrics [Epoch {epoch}]: "
+            #     AP = val_metrics.get("AP", 0.0)
+            #     AP50 = val_metrics.get("AP50", 0.0)
+            #     AP_person = val_metrics.get("AP-per-class/person", 0.0)
+            #     AP_cat = val_metrics.get("AP-per-class/cat", 0.0)
+            #     val_print_str += f"AP: {AP:.3f} AP50: {AP50:.3f} AP-person: {AP_person:.3f} AP-cat: {AP_cat:.3f}"
+            #     accelerator.print(val_print_str)
+            #     accelerator.log(val_metrics, step=global_step)
 
     accelerator.end_training()
+
+
+def format_loss_for_logging(loss_dict, split="train"):
+    logs = {}
+    loss_names = [
+        "loss_label_ce",
+        "loss_l1_bbox",
+        "loss_giou",
+    ]
+    loss_prefix_len = len("loss_")
+    for loss_name in loss_names:
+        name = loss_name[loss_prefix_len:]
+        logs[f"loss/{name}"] = {split: loss_dict[loss_name]}
+
+        loss_by_layer = {}
+        for k, v in loss_dict.items():
+            if k.startswith(loss_name):
+                loss_by_layer[k] = v
+
+        logs[f"loss/{name}_by_decoder_layer"] = loss_by_layer
+
+    logs["cardinality_error"] = {split: loss_dict["cardinality_error"]}
+    error_by_layer = {}
+    for k, v in loss_dict.items():
+        if k.startswith("cardinality_error"):
+            error_by_layer[k] = v
+    logs["cardinality_error_by_decoder_layer"] = error_by_layer
+
+    logs["class_error"] = {split: loss_dict["class_error"]}
+    return logs
 
 
 def run_validation(
@@ -309,19 +338,16 @@ def run_validation(
     model,
     criterion,
     val_dataloader,
-    detection_decoder,
+    # detection_decoder,
     limit_val_iters=0,
     global_step=0,
 ):
-    # debug multiprocessing by printing accelerator.local_process_index
-
-    if accelerator.is_main_process:
-        metrics = DetectionMetrics(val_dataloader.dataset.class_names)
-        total_num_images = len(val_dataloader.dataset)
-        avg_loss = 0
-        avg_objectness_loss = 0
-        avg_class_loss = 0
-        avg_coordinates_loss = 0
+    """
+    NOTE: This function is written without consideration for distributed multi-GPU training.
+    """
+    # metrics = DetectionMetrics(val_dataloader.dataset.class_names)
+    total_num_images = len(val_dataloader.dataset)
+    avg_loss_dict = defaultdict(float)
 
     model.eval()
     with torch.inference_mode():
@@ -334,100 +360,95 @@ def run_validation(
             if limit_val_iters > 0 and step >= limit_val_iters:
                 break
 
-            outputs = model(batch["image"])
             with accelerator.autocast():
+                outputs = model(batch["image"], batch["height"], batch["width"])
                 loss_dict = criterion(outputs, batch)
 
-            outputs = accelerator.gather_for_metrics(outputs)
-            loss_dict = accelerator.gather_for_metrics(loss_dict)
+            # images = batch["image"]
+            # # These are all lists of tensors
+            # boxes = gather_object(batch["boxes"])
+            # class_idx = gather_object(batch["class_idx"])
+            # iscrowd = gather_object(batch["iscrowd"])
 
-            images = accelerator.gather(batch["image"])
-            # These are all lists of tensors
-            boxes = gather_object(batch["boxes"])
-            class_idx = gather_object(batch["class_idx"])
-            iscrowd = gather_object(batch["iscrowd"])
+            num_images = batch["image"].size(0)
+            for k, v in loss_dict.items():
+                avg_loss_dict[k] += v.detach().item() * num_images / total_num_images
 
-            if accelerator.is_main_process:
-                num_images = outputs["tx_ty_tw_th"].shape[0]
+            # preds = detection_decoder(outputs, objectness_threshold=0.5, iou_threshold=0.5)  # cpu
 
-                avg_loss += loss_dict["loss"].sum().item() * num_images / total_num_images
-                avg_objectness_loss += loss_dict["objectness_loss"].sum().item() * num_images / total_num_images
-                avg_class_loss += loss_dict["class_loss"].sum().item() * num_images / total_num_images
-                avg_coordinates_loss += loss_dict["coordinates_loss"].sum().item() * num_images / total_num_images
+            # accelerator.gather_for_metrics will automatically truncate the last batch
+            # gathered_batch = {
+            #     "image": images[:num_images].detach().cpu(),
+            #     "boxes": [x.detach().cpu() for x in boxes[:num_images]],
+            #     "class_idx": [x.detach().cpu() for x in class_idx[:num_images]],
+            #     "iscrowd": [x.detach().cpu() for x in iscrowd[:num_images]],
+            # }
 
-                preds = detection_decoder(outputs, objectness_threshold=0.5, iou_threshold=0.5)  # cpu
+            # metrics.update(preds, gathered_batch)
 
-                # accelerator.gather_for_metrics will automatically truncate the last batch
-                gathered_batch = {
-                    "image": images[:num_images].detach().cpu(),
-                    "boxes": [x.detach().cpu() for x in boxes[:num_images]],
-                    "class_idx": [x.detach().cpu() for x in class_idx[:num_images]],
-                    "iscrowd": [x.detach().cpu() for x in iscrowd[:num_images]],
-                }
-                metrics.update(preds, gathered_batch)
+            # log the predictions for the first batch
+            # Accelerate tensorboard tracker
+            # https://github.com/huggingface/accelerate/blob/main/src/accelerate/tracking.py#L165
+            # if step == 0:
+            #     # lower objectness threshold yields more predictions
+            #     preds_low = detection_decoder(outputs, objectness_threshold=0.25, iou_threshold=0.5)  # cpu
 
-                # log the predictions for the first batch
-                # Accelerate tensorboard tracker
-                # https://github.com/huggingface/accelerate/blob/main/src/accelerate/tracking.py#L165
-                if step == 0:
-                    # lower objectness threshold yields more predictions
-                    preds_low = detection_decoder(outputs, objectness_threshold=0.25, iou_threshold=0.5)  # cpu
+            #     batch_flat = []
+            #     for i in range(gathered_batch["image"].shape[0]):
+            #         item = {k: v[i] for k, v in gathered_batch.items()}
+            #         item["class_names"] = [
+            #             val_dataloader.dataset.class_names[c] for c in item["class_idx"].tolist()
+            #         ]
+            #         batch_flat.append(item)
+            #         preds[i]["image"] = gathered_batch["image"][i]
+            #         preds_low[i]["image"] = gathered_batch["image"][i]
 
-                    batch_flat = []
-                    for i in range(gathered_batch["image"].shape[0]):
-                        item = {k: v[i] for k, v in gathered_batch.items()}
-                        item["class_names"] = [
-                            val_dataloader.dataset.class_names[c] for c in item["class_idx"].tolist()
-                        ]
-                        batch_flat.append(item)
-                        preds[i]["image"] = gathered_batch["image"][i]
-                        preds_low[i]["image"] = gathered_batch["image"][i]
+            #     vis_gt = plot_grid(
+            #         batch_flat,
+            #         max_images=25,
+            #         num_cols=5,
+            #         font_size=20,
+            #         box_color="green",
+            #         fig_scaling=3,
+            #     )
+            #     vis_preds = plot_grid(
+            #         preds,
+            #         max_images=25,
+            #         num_cols=5,
+            #         font_size=20,
+            #         box_color="red",
+            #         fig_scaling=3,
+            #     )
+            #     vis_preds_low = plot_grid(
+            #         preds_low,
+            #         max_images=25,
+            #         num_cols=5,
+            #         font_size=20,
+            #         box_color="red",
+            #         fig_scaling=3,
+            #     )
 
-                    vis_gt = plot_grid(
-                        batch_flat,
-                        max_images=25,
-                        num_cols=5,
-                        font_size=20,
-                        box_color="green",
-                        fig_scaling=3,
-                    )
-                    vis_preds = plot_grid(
-                        preds,
-                        max_images=25,
-                        num_cols=5,
-                        font_size=20,
-                        box_color="red",
-                        fig_scaling=3,
-                    )
-                    vis_preds_low = plot_grid(
-                        preds_low,
-                        max_images=25,
-                        num_cols=5,
-                        font_size=20,
-                        box_color="red",
-                        fig_scaling=3,
-                    )
+            #     tensorboard = accelerator.get_tracker("tensorboard")
+            #     tensorboard.log_images(
+            #         {
+            #             "val-ground-truth": vis_gt,
+            #             "val-predictions": vis_preds,
+            #             "val-predictions-low": vis_preds_low,
+            #         },
+            #         step=global_step,
+            #         dataformats="HWC",
+            #     )
 
-                    tensorboard = accelerator.get_tracker("tensorboard")
-                    tensorboard.log_images(
-                        {
-                            "val-ground-truth": vis_gt,
-                            "val-predictions": vis_preds,
-                            "val-predictions-low": vis_preds_low,
-                        },
-                        step=global_step,
-                        dataformats="HWC",
-                    )
+    avg_loss = sum([loss for k, loss in avg_loss_dict.items() if k.startswith("loss")])
+    logs = {"loss": {"val": avg_loss}}
+    logs.update(format_loss_for_logging(loss_dict, split="val"))
+    accelerator.log(logs, step=global_step)
 
     val_metrics = {}
-    if accelerator.is_main_process:
-        val_metrics = metrics.compute()
-        val_metrics["loss/val"] = avg_loss
-        val_metrics["loss-objectness/val"] = avg_objectness_loss
-        val_metrics["loss-classification/val"] = avg_class_loss
-        val_metrics["loss-coordinates/val"] = avg_coordinates_loss
+    # val_metrics = metrics.compute()
 
-    accelerator.wait_for_everyone()
+    torch.cuda.empty_cache()
+    model.train()
     return val_metrics
 
 
@@ -451,10 +472,11 @@ Run training loop for YoloV3 object detection model on the COCO dataset.
         default="/media/bryan/ssd01/fiftyone/coco-2017",
         help="Path to the COCO dataset",
     )
-    parser.add_argument("--train-batch-size", type=int, default=2, help="Training batch size")
-    parser.add_argument("--val-batch-size", type=int, default=16, help="Training batch size")
-    parser.add_argument("--epochs", type=int, default=300, help="Epochs")
+    parser.add_argument("--train-batch-size", type=int, default=4, help="Training batch size")
+    parser.add_argument("--val-batch-size", type=int, default=16, help="Validation batch size")
+    parser.add_argument("--epochs", type=int, default=100, help="Epochs")
     parser.add_argument("--lr-warmup-epochs", type=int, default=5, help="Warmup epochs")
+    parser.add_argument("--lr-hold-max-epochs", type=int, default=35, help="Hold max LR epochs")
     parser.add_argument(
         "--limit-train-iters",
         type=int,
@@ -480,14 +502,9 @@ Run training loop for YoloV3 object detection model on the COCO dataset.
         help="Path to a specific checkpoint folder that the training should resume from.",
     )
     parser.add_argument(
-        "--eval-only",
-        action="store_true",
-        help="Only run evaluation on the validation set.",
-    )
-    parser.add_argument(
         "--eval-epochs",
         type=int,
-        default=1,
+        default=10,
         help="Frequency of evaluation in epochs",
     )
     return parser.parse_args()
@@ -503,11 +520,11 @@ if __name__ == "__main__":
         val_batch_size=args.val_batch_size,
         epochs=args.epochs,
         lr_warmup_epochs=args.lr_warmup_epochs,
+        lr_hold_max_epochs=args.lr_hold_max_epochs,
         limit_train_iters=args.limit_train_iters,
         limit_val_iters=args.limit_val_iters,
         start_epoch=args.start_epoch,
         resume_from_checkpoint=args.resume_from_checkpoint,
-        eval_only=args.eval_only,
         eval_epochs=args.eval_epochs,
     )
     # optionally overwrite DETR model parameters
