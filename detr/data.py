@@ -215,11 +215,8 @@ def get_collate_function(divisible_by: int = 32):
 
         batch["boxes_normalized"] = []
         for height, width, boxes in zip(batch["height"], batch["width"], batch["boxes"]):
-            copied = boxes.clone()
-            copied[..., [0, 2]] /= width
-            copied[..., [1, 3]] /= height
-            batch["boxes_normalized"].append(copied)
-
+            boxes_norm = boxes / torch.tensor([width, height, width, height], dtype=torch.float).unsqueeze(0)
+            batch["boxes_normalized"].append(boxes_norm)
         return batch
 
     return collate_function

@@ -23,7 +23,7 @@ from detr.data import (
 )
 from detr.matcher import HungarianMatcher
 from detr.loss import SetCriterion
-from detr.utils import DetectionMetrics
+from detr.utils import DetectionMetrics, PostProcess
 
 
 @dataclass
@@ -239,6 +239,7 @@ def train_DETR(config: TrainingConfig, detr_config: DETRConfig):
     global_step = 0
     for epoch in range(config.start_epoch, config.epochs):
         model.train()
+        criterion.train()
         for step, batch in (
             progress_bar := tqdm(
                 enumerate(train_dataloader),
@@ -254,7 +255,7 @@ def train_DETR(config: TrainingConfig, detr_config: DETRConfig):
                 with accelerator.autocast():
                     outputs = model(batch["image"], batch["height"], batch["width"])
                     loss_dict = criterion(outputs, batch)
-                    loss = sum(loss_dict[k] for k in loss_dict.keys() if k.startswith("loss"))
+                    loss = sum(v for k, v in loss_dict.items() if k.startswith("loss"))
                 accelerator.backward(loss)  # accumulates gradients
 
             accelerator.clip_grad_norm_(model.parameters(), config.gradient_max_norm)
@@ -345,11 +346,13 @@ def run_validation(
     """
     NOTE: This function is written without consideration for distributed multi-GPU training.
     """
-    # metrics = DetectionMetrics(val_dataloader.dataset.class_names)
+    post_process = PostProcess()
+    metrics = DetectionMetrics(val_dataloader.dataset.class_names)
     total_num_images = len(val_dataloader.dataset)
     avg_loss_dict = defaultdict(float)
 
     model.eval()
+    criterion.eval()
     with torch.inference_mode():
         for step, batch in tqdm(
             enumerate(val_dataloader),
@@ -374,6 +377,19 @@ def run_validation(
             for k, v in loss_dict.items():
                 avg_loss_dict[k] += v.detach().item() * num_images / total_num_images
 
+            preds = post_process(
+                outputs["pred_logits"][:, -1].detach().cpu(),
+                outputs["pred_boxes"][:, -1].detach().cpu(),
+                batch["height"].detach().cpu(),
+                batch["width"].detach().cpu(),
+            )
+            for key in batch:
+                if isinstance(batch[key], torch.Tensor):
+                    batch[key] = batch[key].detach().cpu()
+                elif isinstance(batch[key], list):
+                    if isinstance(batch[key][0], torch.Tensor):
+                        batch[key] = [x.detach().cpu() for x in batch[key]]
+
             # preds = detection_decoder(outputs, objectness_threshold=0.5, iou_threshold=0.5)  # cpu
 
             # accelerator.gather_for_metrics will automatically truncate the last batch
@@ -384,7 +400,7 @@ def run_validation(
             #     "iscrowd": [x.detach().cpu() for x in iscrowd[:num_images]],
             # }
 
-            # metrics.update(preds, gathered_batch)
+            metrics.update(preds, batch)
 
             # log the predictions for the first batch
             # Accelerate tensorboard tracker
@@ -444,11 +460,9 @@ def run_validation(
     logs.update(format_loss_for_logging(loss_dict, split="val"))
     accelerator.log(logs, step=global_step)
 
-    val_metrics = {}
-    # val_metrics = metrics.compute()
+    val_metrics = metrics.compute()
 
     torch.cuda.empty_cache()
-    model.train()
     return val_metrics
 
 

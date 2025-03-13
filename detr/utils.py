@@ -2,6 +2,8 @@ from typing import List
 import torch
 from torchmetrics.detection import MeanAveragePrecision
 from torchvision.ops.boxes import box_area
+from torchvision.tv_tensors import BoundingBoxFormat
+from torchvision.transforms.v2.functional import convert_bounding_box_format
 
 
 class DetectionMetrics:
@@ -112,3 +114,27 @@ def accuracy(output, target, topk=(1,)):
         correct_k = correct[:k].view(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
+
+
+class PostProcess(torch.nn.Module):
+    """This module converts the model's output into the format expected by the coco api"""
+
+    @torch.no_grad()
+    def forward(self, pred_logits, pred_boxes, image_heights, image_widths):
+        """
+        pred_logits: Tensor of dim [batch_size, num_queries, num_classes] with the classification logits.
+        pred_boxes: Tensor of dim [batch_size, num_queries, 4] with the predicted box coordinates.
+
+        image_heights: Tensor of dim [batch_size] with the image heights.
+        image_widths: Tensor of dim [batch_size] with the image widths.
+        """
+        assert len(pred_logits) == len(pred_boxes)
+
+        pred_probs = pred_logits.softmax(-1)
+        # exclude the probability for no object as an option for the highest class
+        scores, labels = pred_probs[..., :-1].max(-1)
+        pred_boxes_xywy = convert_bounding_box_format(pred_boxes, BoundingBoxFormat.CXCYWH, BoundingBoxFormat.XYXY)
+        scale_fct = torch.stack([image_widths, image_heights, image_widths, image_heights], dim=1)
+        pred_boxes_xywy_scaled = pred_boxes_xywy * scale_fct[:, None, :]
+        results = [{"scores": s, "labels": l, "boxes": b} for s, l, b in zip(scores, labels, pred_boxes_xywy_scaled)]
+        return results

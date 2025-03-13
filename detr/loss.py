@@ -8,9 +8,11 @@ import torch
 from torch import nn
 
 from detr.matcher import HungarianMatcher
-from detr.utils import accuracy, generalized_box_iou
+from detr.utils import accuracy
 from torchvision.tv_tensors import BoundingBoxFormat
 from torchvision.transforms.v2.functional import convert_bounding_box_format
+
+from torchvision.ops import generalized_box_iou_loss
 
 
 class SetCriterion(nn.Module):
@@ -139,22 +141,25 @@ class SetCriterion(nn.Module):
         """
         total_num_gt_boxes = max(sum([len(gt_boxes) for gt_boxes in batch_gt_boxes]), 1)
         idx = self._get_src_permutation_idx(indices)
-        src_boxes = pred_boxes[idx]
+        src_boxes = pred_boxes[idx]  # [num_gt_boxes, 4]
         target_boxes = torch.cat(
             [gt_boxes[gt_box_indices] for gt_boxes, (_, gt_box_indices) in zip(batch_gt_boxes, indices)], dim=0
-        )
+        )  # [num_gt_boxes, 4]
 
         target_boxes_cxcywh = convert_bounding_box_format(
             target_boxes, BoundingBoxFormat.XYXY, BoundingBoxFormat.CXCYWH
         )
-        loss_bbox = torch.nn.functional.l1_loss(src_boxes, target_boxes_cxcywh, reduction="sum") / total_num_gt_boxes
-        loss_bbox *= self.weight_bbox_l1
-
+        loss_bbox = (
+            self.weight_bbox_l1
+            * torch.nn.functional.l1_loss(src_boxes, target_boxes_cxcywh, reduction="sum")
+            / total_num_gt_boxes
+        )
         src_boxes_xyxy = convert_bounding_box_format(src_boxes, BoundingBoxFormat.CXCYWH, BoundingBoxFormat.XYXY)
-        giou = generalized_box_iou(src_boxes_xyxy, target_boxes)
-        loss_giou = 1 - torch.diag(giou)
-        loss_giou = loss_giou.sum() / total_num_gt_boxes
-        loss_giou *= self.weight_bbox_giou
+        loss_giou = (
+            self.weight_bbox_giou
+            * generalized_box_iou_loss(src_boxes_xyxy, target_boxes, reduction="sum")
+            / total_num_gt_boxes
+        )
 
         return loss_bbox, loss_giou
 
