@@ -38,8 +38,8 @@ class TrainingConfig:
 
     # the train batch size used in the paper when training across multiple GPUs
     cumulative_train_batch_size: int = field(default=64)
-    train_batch_size: int = field(default=4)
-    val_batch_size: int = field(default=16)
+    train_batch_size: int = field(default=5)
+    val_batch_size: int = field(default=25)
 
     epochs: int = field(default=100)
     limit_train_iters: int = field(default=0)
@@ -66,7 +66,9 @@ class TrainingConfig:
     # Regularization and Augmentation
     weight_decay: float = field(default=1e-4)
     norm_weight_decay: float = field(default=0.0)
-    gradient_max_norm: float = field(default=0.1)
+    # official DETR implementation uses gradient clipping max norm 0.1,
+    # which is fairly small.
+    gradient_max_norm: float = field(default=1.0)
 
     # label_smoothing: float = 0.0
 
@@ -76,6 +78,7 @@ class TrainingConfig:
     checkpoint_epochs: int = field(default=1)
     save_image_epochs: int = field(default=1)
     seed: int = field(default=0)
+    log_frequency: int = field(default=100)
 
     num_workers: int = field(default=2)
 
@@ -271,11 +274,12 @@ def train_DETR(config: TrainingConfig, detr_config: DETRConfig):
                 "epoch": epoch,
             }
             progress_bar.set_postfix(**logs)
-            logs["loss"] = {"train": loss.detach().item()}
-            for k in loss_dict.keys():
-                loss_dict[k] = loss_dict[k].detach().item()
-            logs.update(format_loss_for_logging(loss_dict, split="train"))
-            accelerator.log(logs, step=global_step)
+            if step % config.log_frequency == 0:
+                logs["loss"] = {"train": loss.detach().item()}
+                for k in loss_dict.keys():
+                    loss_dict[k] = loss_dict[k].detach().item()
+                logs.update(format_loss_for_logging(loss_dict, split="train"))
+                accelerator.log(logs, step=global_step)
             global_step += 1
 
         if epoch % config.checkpoint_epochs == 0:
@@ -474,8 +478,8 @@ Run training loop for YoloV3 object detection model on the COCO dataset.
         default="/media/bryan/ssd01/fiftyone/coco-2017",
         help="Path to the COCO dataset",
     )
-    parser.add_argument("--train-batch-size", type=int, default=4, help="Training batch size")
-    parser.add_argument("--val-batch-size", type=int, default=16, help="Validation batch size")
+    parser.add_argument("--train-batch-size", type=int, default=5, help="Training batch size")
+    parser.add_argument("--val-batch-size", type=int, default=25, help="Validation batch size")
     parser.add_argument("--epochs", type=int, default=100, help="Epochs")
     parser.add_argument("--lr-warmup-epochs", type=int, default=5, help="Warmup epochs")
     parser.add_argument("--lr-hold-max-epochs", type=int, default=35, help="Hold max LR epochs")
