@@ -119,6 +119,10 @@ def accuracy(output, target, topk=(1,)):
 class PostProcess(torch.nn.Module):
     """This module converts the model's output into the format expected by the coco api"""
 
+    def __init__(self, class_names: List[str]):
+        super().__init__()
+        self.class_names = class_names
+
     @torch.no_grad()
     def forward(self, pred_logits, pred_boxes, image_heights, image_widths):
         """
@@ -136,5 +140,8 @@ class PostProcess(torch.nn.Module):
         pred_boxes_xywy = convert_bounding_box_format(pred_boxes, BoundingBoxFormat.CXCYWH, BoundingBoxFormat.XYXY)
         scale_fct = torch.stack([image_widths, image_heights, image_widths, image_heights], dim=1)
         pred_boxes_xywy_scaled = pred_boxes_xywy * scale_fct[:, None, :]
-        results = [{"scores": s, "labels": l, "boxes": b} for s, l, b in zip(scores, labels, pred_boxes_xywy_scaled)]
+        results = []
+        for s, label_indices, b in zip(scores, labels, pred_boxes_xywy_scaled):
+            class_names = [self.class_names[i] for i in label_indices]
+            results.append({"scores": s, "labels": label_indices, "boxes": b, "class_names": class_names})
         return results

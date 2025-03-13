@@ -24,6 +24,7 @@ from detr.data import (
 from detr.matcher import HungarianMatcher
 from detr.loss import SetCriterion
 from detr.utils import DetectionMetrics, PostProcess
+from detr.visualize import plot_grid
 
 
 @dataclass
@@ -290,15 +291,31 @@ def train_DETR(config: TrainingConfig, detr_config: DETRConfig):
                 limit_val_iters=config.limit_val_iters,
                 global_step=global_step,
             )
-            # if accelerator.is_main_process:
-            #     val_print_str = f"Validation metrics [Epoch {epoch}]: "
-            #     AP = val_metrics.get("AP", 0.0)
-            #     AP50 = val_metrics.get("AP50", 0.0)
-            #     AP_person = val_metrics.get("AP-per-class/person", 0.0)
-            #     AP_cat = val_metrics.get("AP-per-class/cat", 0.0)
-            #     val_print_str += f"AP: {AP:.3f} AP50: {AP50:.3f} AP-person: {AP_person:.3f} AP-cat: {AP_cat:.3f}"
-            #     accelerator.print(val_print_str)
-            #     accelerator.log(val_metrics, step=global_step)
+            if accelerator.is_main_process:
+                val_print_str = f"Validation metrics [Epoch {epoch}]: "
+                AP = val_metrics.pop("AP", 0.0)
+                AP50 = val_metrics.pop("AP50", 0.0)
+                AP_person = val_metrics.get("AP-per-class/person", 0.0)
+                AP_cat = val_metrics.get("AP-per-class/cat", 0.0)
+                val_print_str += f"AP: {AP:.3f} AP50: {AP50:.3f} AP-person: {AP_person:.3f} AP-cat: {AP_cat:.3f}"
+                accelerator.print(val_print_str)
+
+                # consolidate AP plots
+                AP75 = val_metrics.pop("AP75", 0.0)
+                val_metrics["Average Precision"] = {
+                    "AP": AP,
+                    "AP50": AP50,
+                    "AP75": AP75,
+                }
+                AP_large = val_metrics.pop("AP-large", 0.0)
+                AP_medium = val_metrics.pop("AP-medium", 0.0)
+                AP_small = val_metrics.pop("AP-small", 0.0)
+                val_metrics["Average Precision by Object Size"] = {
+                    "AP-large": AP_large,
+                    "AP-medium": AP_medium,
+                    "AP-small": AP_small,
+                }
+                accelerator.log(val_metrics, step=global_step)
 
     accelerator.end_training()
 
@@ -320,17 +337,17 @@ def format_loss_for_logging(loss_dict, split="train"):
             if k.startswith(loss_name):
                 loss_by_layer[k] = v
 
-        logs[f"loss/{name}_by_decoder_layer"] = loss_by_layer
+        logs[f"loss by decoder layer/{name}-{split}"] = loss_by_layer
 
-    name = "error in number of object predictions"
+    name = "Incorrect Number of Object Predictions"
     logs[f"{name}/cardinality_error"] = {split: loss_dict["cardinality_error"]}
     error_by_layer = {}
     for k, v in loss_dict.items():
         if k.startswith("cardinality_error"):
             error_by_layer[k] = v
-    logs[f"{name}/cardinality_error_by_decoder_layer"] = error_by_layer
+    logs[f"{name}/by decoder layer {split}"] = error_by_layer
 
-    logs["class_error"] = {split: loss_dict["class_error"]}
+    logs["Classification Error (1 - accuracy)"] = {split: loss_dict["class_error"]}
     return logs
 
 
@@ -339,14 +356,13 @@ def run_validation(
     model,
     criterion,
     val_dataloader,
-    # detection_decoder,
     limit_val_iters=0,
     global_step=0,
 ):
     """
     NOTE: This function is written without consideration for distributed multi-GPU training.
     """
-    post_process = PostProcess()
+    post_process = PostProcess(val_dataloader.dataset.class_names)
     metrics = DetectionMetrics(val_dataloader.dataset.class_names)
     total_num_images = len(val_dataloader.dataset)
     avg_loss_dict = defaultdict(float)
@@ -367,22 +383,10 @@ def run_validation(
                 outputs = model(batch["image"], batch["height"], batch["width"])
                 loss_dict = criterion(outputs, batch)
 
-            # images = batch["image"]
-            # # These are all lists of tensors
-            # boxes = gather_object(batch["boxes"])
-            # class_idx = gather_object(batch["class_idx"])
-            # iscrowd = gather_object(batch["iscrowd"])
-
             num_images = batch["image"].size(0)
             for k, v in loss_dict.items():
                 avg_loss_dict[k] += v.detach().item() * num_images / total_num_images
 
-            preds = post_process(
-                outputs["pred_logits"][:, -1].detach().cpu(),
-                outputs["pred_boxes"][:, -1].detach().cpu(),
-                batch["height"].detach().cpu(),
-                batch["width"].detach().cpu(),
-            )
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].detach().cpu()
@@ -390,70 +394,54 @@ def run_validation(
                     if isinstance(batch[key][0], torch.Tensor):
                         batch[key] = [x.detach().cpu() for x in batch[key]]
 
-            # preds = detection_decoder(outputs, objectness_threshold=0.5, iou_threshold=0.5)  # cpu
-
-            # accelerator.gather_for_metrics will automatically truncate the last batch
-            # gathered_batch = {
-            #     "image": images[:num_images].detach().cpu(),
-            #     "boxes": [x.detach().cpu() for x in boxes[:num_images]],
-            #     "class_idx": [x.detach().cpu() for x in class_idx[:num_images]],
-            #     "iscrowd": [x.detach().cpu() for x in iscrowd[:num_images]],
-            # }
-
+            preds = post_process(
+                outputs["pred_logits"][:, -1].detach().cpu(),
+                outputs["pred_boxes"][:, -1].detach().cpu(),
+                batch["height"].detach().cpu(),
+                batch["width"].detach().cpu(),
+            )
             metrics.update(preds, batch)
 
             # log the predictions for the first batch
             # Accelerate tensorboard tracker
             # https://github.com/huggingface/accelerate/blob/main/src/accelerate/tracking.py#L165
-            # if step == 0:
-            #     # lower objectness threshold yields more predictions
-            #     preds_low = detection_decoder(outputs, objectness_threshold=0.25, iou_threshold=0.5)  # cpu
+            if step == 0:
+                batch_flat = []
+                for i in range(batch["image"].shape[0]):
+                    item = {
+                        "image": batch["image"][i].detach().cpu(),
+                        "boxes": batch["boxes"][i].detach().cpu(),
+                        "class_names": [val_dataloader.dataset.class_names[c] for c in batch["class_idx"][i].tolist()],
+                    }
+                    batch_flat.append(item)
+                    preds[i]["image"] = item["image"]
 
-            #     batch_flat = []
-            #     for i in range(gathered_batch["image"].shape[0]):
-            #         item = {k: v[i] for k, v in gathered_batch.items()}
-            #         item["class_names"] = [
-            #             val_dataloader.dataset.class_names[c] for c in item["class_idx"].tolist()
-            #         ]
-            #         batch_flat.append(item)
-            #         preds[i]["image"] = gathered_batch["image"][i]
-            #         preds_low[i]["image"] = gathered_batch["image"][i]
+                vis_gt = plot_grid(
+                    batch_flat,
+                    max_images=25,
+                    num_cols=5,
+                    font_size=20,
+                    box_color="green",
+                    fig_scaling=7,
+                )
+                vis_preds = plot_grid(
+                    preds,
+                    max_images=25,
+                    num_cols=5,
+                    font_size=20,
+                    box_color="red",
+                    fig_scaling=7,
+                )
 
-            #     vis_gt = plot_grid(
-            #         batch_flat,
-            #         max_images=25,
-            #         num_cols=5,
-            #         font_size=20,
-            #         box_color="green",
-            #         fig_scaling=3,
-            #     )
-            #     vis_preds = plot_grid(
-            #         preds,
-            #         max_images=25,
-            #         num_cols=5,
-            #         font_size=20,
-            #         box_color="red",
-            #         fig_scaling=3,
-            #     )
-            #     vis_preds_low = plot_grid(
-            #         preds_low,
-            #         max_images=25,
-            #         num_cols=5,
-            #         font_size=20,
-            #         box_color="red",
-            #         fig_scaling=3,
-            #     )
-
-            #     tensorboard = accelerator.get_tracker("tensorboard")
-            #     tensorboard.log_images(
-            #         {
-            #             "val-ground-truth": vis_gt,
-            #             "val-predictions": vis_preds,
-            #             "val-predictions-low": vis_preds_low,
-            #         },
-            #         step=global_step,
-            #         dataformats="HWC",
-            #     )
+                tensorboard = accelerator.get_tracker("tensorboard")
+                tensorboard.log_images(
+                    {
+                        "val-ground-truth": vis_gt,
+                        "val-predictions": vis_preds,
+                    },
+                    step=global_step,
+                    dataformats="HWC",
+                )
 
     avg_loss = sum([loss for k, loss in avg_loss_dict.items() if k.startswith("loss")])
     logs = {"loss": {"val": avg_loss}}
