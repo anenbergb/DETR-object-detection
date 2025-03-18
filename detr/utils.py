@@ -124,24 +124,32 @@ class PostProcess(torch.nn.Module):
         self.class_names = class_names
 
     @torch.no_grad()
-    def forward(self, pred_logits, pred_boxes, image_heights, image_widths):
+    def forward(self, pred_logits, pred_boxes, image_heights, image_widths, score_threshold=0.0):
         """
         pred_logits: Tensor of dim [batch_size, num_queries, num_classes] with the classification logits.
         pred_boxes: Tensor of dim [batch_size, num_queries, 4] with the predicted box coordinates.
 
         image_heights: Tensor of dim [batch_size] with the image heights.
         image_widths: Tensor of dim [batch_size] with the image widths.
+
+        score_threshold: float, threshold used to filter detections with low confidence.
         """
         assert len(pred_logits) == len(pred_boxes)
 
         pred_probs = pred_logits.softmax(-1)
         # exclude the probability for no object as an option for the highest class
         scores, labels = pred_probs[..., :-1].max(-1)
-        pred_boxes_xywy = convert_bounding_box_format(pred_boxes, BoundingBoxFormat.CXCYWH, BoundingBoxFormat.XYXY)
+        pred_boxes_xyxy = convert_bounding_box_format(pred_boxes, BoundingBoxFormat.CXCYWH, BoundingBoxFormat.XYXY)
         scale_fct = torch.stack([image_widths, image_heights, image_widths, image_heights], dim=1)
-        pred_boxes_xywy_scaled = pred_boxes_xywy * scale_fct[:, None, :]
+        pred_boxes_xyxy_scaled = pred_boxes_xyxy * scale_fct[:, None, :]
+
         results = []
-        for s, label_indices, b in zip(scores, labels, pred_boxes_xywy_scaled):
+        for s, label_indices, b in zip(scores, labels, pred_boxes_xyxy_scaled):
+            # Apply score threshold
+            keep = s >= score_threshold
+            s = s[keep]
+            label_indices = label_indices[keep]
+            b = b[keep]
             class_names = [self.class_names[i] for i in label_indices]
             results.append({"scores": s, "labels": label_indices, "boxes": b, "class_names": class_names})
         return results
