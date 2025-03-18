@@ -46,17 +46,28 @@ Subsequent papers such as [Deformable DETR](https://arxiv.org/abs/2010.04159) ad
 <img src="https://github.com/user-attachments/assets/a7f0402c-cfa0-4a1c-ad1f-a527d7ebbba2" width="1000"/>
 
 
-### The results when applying a 0.75 score threshold
+### Despite the low Average Precision numerical results, the visualized detections of the 100 epoch model look reasonble
+(These results are visualized with a 0.75 score threshold)
+
 <img src="https://github.com/user-attachments/assets/3bf891d0-a500-4a40-baf2-d3011cec9550" width="600"/>
 
-### The results when applying a 0.50 score threshold
-<img src="https://github.com/user-attachments/assets/283ddc39-95b4-479a-b545-902f074f77c5" width="600"/>
+More predictions can be visualized when using a lower score threshold of 0.50 (or no score threshold)
+<img src="https://github.com/user-attachments/assets/283ddc39-95b4-479a-b545-902f074f77c5" width="400"/>
+<img src="https://github.com/user-attachments/assets/d05fbebe-68e3-4593-9aae-28a414de51e5" width="400"/>
 
-### The results without a score threshold
-<img src="https://github.com/user-attachments/assets/d05fbebe-68e3-4593-9aae-28a414de51e5" width="600"/>
-
-### The ground truth boxes
+### The ground truth boxes are the following
 <img src="https://github.com/user-attachments/assets/70c6c7dd-d67f-41d3-b876-a87f960ace0e" width="600"/>
+
+### The following images illustrate the evolution of the predicted object queries.
+Early in training after 10 epochs the predicted object queries are often grouped together at a central location in the image.
+As the model trains, the object queries begin to specialize, and the predicted boxes become more diverse and cover a greater extent of the image.
+The following three images visualize the predicted queries after 10, 20, and 40 epochs. 
+
+<img src="https://github.com/user-attachments/assets/df30be93-70ce-42ef-a9bb-c92c947b68e4" width="300"/>
+<img src="https://github.com/user-attachments/assets/6a239a4f-cc7c-4248-b432-250206f4f77f" width="300"/>
+<img src="https://github.com/user-attachments/assets/72bb3a0a-89c6-495e-aba5-fdda2f96c186" width="300"/>
+
+
 
 ##  Positional Embeddings in Transformers
 Transformers, by design, are permutation-invariant. This means they don't inherently understand the order of the input sequence. For tasks like natural language processing (NLP), where word order is crucial, or object detection, where spatial relationships matter, positional embeddings are essential.
