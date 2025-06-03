@@ -1,5 +1,5 @@
 # DETR-object-detection
-Implementation of DETR: End-to-End Object Detection with Transformers
+Implementation of [DETR: End-to-End Object Detection with Transformers](https://arxiv.org/abs/2005.12872)
 
 # 100 Epoch Training Results
 DETR requires a very long training schedule (500 epochs) to achieve the published average precision results.
