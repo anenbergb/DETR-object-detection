@@ -461,7 +461,7 @@ def run_validation(
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         """
-Run training loop for YoloV3 object detection model on the COCO dataset.
+Run training loop for DETR object detection model on the COCO dataset.
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
